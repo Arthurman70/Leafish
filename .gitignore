@@ -14,3 +14,8 @@ Leafish.code-workspace
 # this is part of compiling the installer (but we don't want to upload it)
 install/resources/wrapper.jar
 install/resources/bootstrap_*
+
+# Private packets captured from an installed Minecraft reference server.
+# Synthetic numeric chunk fixtures in chunks-767 remain versioned.
+/protocol/tests/fixtures/configuration-767/
+/tools/__pycache__/

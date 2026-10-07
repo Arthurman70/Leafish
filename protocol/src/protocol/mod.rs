@@ -47,6 +47,10 @@ use crate::nbt;
 use crate::shared::{Position, Version};
 
 pub mod forge;
+pub mod configuration;
+pub mod chunk767;
+pub mod modern_transport;
+pub mod play767;
 pub mod login;
 pub mod microsoft;
 pub mod offline_acc;

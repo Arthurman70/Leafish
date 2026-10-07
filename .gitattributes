@@ -1,0 +1,4 @@
+# Keep independently generated fixture bytes and generator hashes reproducible.
+/protocol/tests/fixtures/chunks-767/*.bin -text
+/protocol/tests/fixtures/chunks-767/*.json text eol=lf
+/tools/PaletteReference.java text eol=lf

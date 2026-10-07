@@ -1,0 +1,36 @@
+{
+  "minecraft": "1.21.1",
+  "encoder": "net.minecraft.world.level.chunk.PalettedContainer.write",
+  "named_reference_jar_sha256": "bace592e2b553b640f66050664cad6a38d50f96f06e203d58f29cfab3012c9a7",
+  "source_generator_sha256": "8858a0998b9bb152ec966647f6a4aa05e669183642b42e495c5bd8f685e2d58e",
+  "game_launched": false,
+  "original_files_written": false,
+  "fixtures": [
+    {
+      "file": "expected-biomes-u32le.bin",
+      "sha256": "b92ac7b8e82a7f2ee7c89b64f21b872bd63108dfdd52719126167ec7e6847a77",
+      "bytes": 1536
+    },
+    {
+      "file": "expected-blocks-u32le.bin",
+      "sha256": "65c72a3d472c878ddd550a919a46caea3c16a0b44b545245a551a1dc93794e6b",
+      "bytes": 98304
+    },
+    {
+      "file": "parameters.json",
+      "sha256": "acbcd03fa1ff117261266c82e56ad3448b93a6368cc499dbe434361ee6977d16",
+      "bytes": 191
+    },
+    {
+      "file": "sections.bin",
+      "sha256": "c453029cfc9320a9c695a3441585ea124ebbec3a613e7772eb82bbf115590b55",
+      "bytes": 24266
+    }
+  ],
+  "generator_source": "tools/PaletteReference.java",
+  "data_origin": "Artificial Object registries with synthetic numeric identities only; no captured worlds or real registry definitions.",
+  "reference_archive_included": false,
+  "default_tests_require_reference_archive": false,
+  "captured_generator_sha256": "8858a0998b9bb152ec966647f6a4aa05e669183642b42e495c5bd8f685e2d58e",
+  "source_generator_hash_format": "UTF-8 with LF line endings"
+}

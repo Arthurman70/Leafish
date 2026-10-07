@@ -380,7 +380,11 @@ mod tests {
             //(vine, Some(Tool::Shears), Some(0.3)),
         ];
         for (block, tool, time) in data {
-            let result = block.get_mining_time(&tool).map(|d| d.as_secs_f64());
+            let result = match block.get_mining_time(&tool) {
+                MiningTime::Instant => Some(0.0),
+                MiningTime::Time(duration) => Some(duration.as_secs_f64()),
+                MiningTime::Never => None,
+            };
             match (time, result) {
                 (Some(time), Some(result)) => assert_eq!(result, time,
                     "Expected to mine block {:?} with {:?} in {} seconds, but it took {} seconds",

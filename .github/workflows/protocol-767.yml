@@ -1,0 +1,25 @@
+name: Protocol 767 conformance
+
+on:
+  push:
+    branches: [minecraft-1.21.1]
+  pull_request:
+    branches: [minecraft-1.21.1]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  protocol:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run portable protocol and synthetic reference tests
+        run: cargo test --locked -p leafish_protocol
+      - name: Build isolated conformance probes
+        run: cargo build --locked -p leafish_protocol --examples

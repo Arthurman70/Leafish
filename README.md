@@ -1,5 +1,38 @@
 # <img src="resources/assets/leafish/logo/leafish-logo.svg" width="75" alt="Leafish logo"> Leafish
 
+## This fork: Minecraft 1.21.1 port in progress
+
+This fork continues Leafish as a native Rust client, targeting Minecraft Java
+1.21.1 (protocol 767), with NeoForge 21.1.236 and Create compatibility as later
+integration targets. **It is not yet a playable 1.21.1 client.**
+
+An isolated vanilla 1.21.1 test now completes configuration and a bounded Play
+session without a renderer: 45 chunks, 1,080 sections, 4,423,680 block-state
+values, and two distinct keepalive exchanges. The section decoder also passes
+independent fixtures produced by Minecraft's own encoder. An independent saved-world
+comparison matched all 4,423,680 block-state values and 69,120 biome values from
+those 45 chunks.
+
+The Windows client builds, and 52 protocol tests pass. Many Play packets remain
+observed but unimplemented; these results do not establish playable 1.21.1
+support. See the port notes for the separate known legacy test failure.
+
+This work does not currently provide NeoForge/Create mod parity, a Rust server,
+verified 1.21.1 GUI compatibility, or measured performance improvements. Protocol
+767 is not advertised as a supported gameplay version. The legacy version table
+below describes upstream Leafish support.
+
+See [port status and portable build/test instructions](PORTING_1_21_1.md) and
+[the existing-fork review](FORK_RESEARCH.md). The review found useful partial
+1.20.4 work, but did not verify an existing 1.21.1 port in the public branches
+checked.
+
+The upstream README, credits, and links are preserved below. Its installers
+and releases are upstream artifacts; they do not contain this port. Its general
+graphics and performance statements are not benchmark results for this fork.
+
+---
+
 Multi-version Minecraft-compatible client written in Rust, forked from [Stevenarella](https://github.com/iceiix/stevenarella/).
 
 Installer: https://github.com/Lea-fish/Leafish/releases/tag/v0.0.1-alpha
