@@ -1,4 +1,4 @@
-name: Protocol 767 conformance
+name: Minecraft 1.21.1 port verification
 
 on:
   push:
@@ -23,3 +23,30 @@ jobs:
         run: cargo test --locked -p leafish_protocol
       - name: Build isolated conformance probes
         run: cargo build --locked -p leafish_protocol --examples
+      - name: Verify exact state catalog behavior using synthetic data
+        run: cargo test --locked -p leafish_blocks catalog::
+
+  client:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-port-client-${{ hashFiles('Cargo.lock') }}
+      - name: Install Linux native build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libgtk-3-dev
+      - name: Verify client storage, resources, models, and native adapter
+        run: cargo test --locked -p leafish --bin leafish
+      - name: Build development client
+        run: cargo build --locked -p leafish

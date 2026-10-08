@@ -65,7 +65,7 @@ impl ChunkBuilder {
             let mut chunks = world.chunks.write();
             let chunk = chunks.get_mut(&CPos(val.position.0, val.position.2));
             if let Some(chunk) = chunk {
-                let section = chunk.sections[val.position.1 as usize].as_mut();
+                let section = chunk.section_mut(val.position.1);
 
                 if let Some(sec) = section {
                     sec.cull_info = val.cull_info;

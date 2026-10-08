@@ -14,13 +14,13 @@
 
 extern crate leafish_resources as internal;
 
+mod local;
+
 use log::warn;
 
 use crate::paths;
 
-use std::collections::HashMap;
 use std::fs;
-use std::hash::BuildHasherDefault;
 use std::io;
 use std::path;
 use std::sync::atomic::AtomicUsize;
@@ -28,7 +28,6 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
-use crate::types::hash::FNVHash;
 use crate::ui;
 use std::fs::File;
 
@@ -100,6 +99,17 @@ impl Manager {
         provided_assets: Option<String>,
         provided_client: Option<String>,
     ) -> (Manager, ManagerUI) {
+        // An explicitly selected client always takes precedence over old caches.
+        // Mount its bytes directly: never extract modern assets into a legacy
+        // version directory or start downloads for a different asset version.
+        if let Some(client) = provided_client.as_ref() {
+            return Self::from_local_sources(
+                path::Path::new(client),
+                provided_assets.as_deref().map(path::Path::new),
+                &[],
+            )
+            .expect("Could not open the explicitly selected local Minecraft assets");
+        }
         let mut m = Manager {
             packs: Vec::new(),
             version: 0,
@@ -120,6 +130,48 @@ impl Manager {
                 num_tasks: 0,
             },
         )
+    }
+
+    /// Construct a resource stack without filesystem writes or network access.
+    /// Later packs take priority; the built-in Leafish pack is always first.
+    pub fn from_packs(packs: Vec<Box<dyn Pack>>) -> Manager {
+        let mut manager = Manager {
+            packs: vec![Box::new(InternalPack)],
+            version: 1,
+            vanilla_progress: Arc::new(Mutex::new(Progress { tasks: vec![] })),
+            pending_downloads: Arc::new(AtomicUsize::new(0)),
+        };
+        for pack in packs {
+            manager.add_pack(pack);
+        }
+        manager
+    }
+
+    pub fn from_local_sources(
+        client_archive: &path::Path,
+        asset_index: Option<&path::Path>,
+        extra_archives: &[path::PathBuf],
+    ) -> io::Result<(Manager, ManagerUI)> {
+        let mut packs: Vec<Box<dyn Pack>> = Vec::new();
+        if let Some(index) = asset_index {
+            packs.push(Box::new(local::IndexedPack::from_index(index)?));
+        }
+        packs.push(Box::new(local::ArchivePack::open_archive(client_archive)?));
+        for archive in extra_archives {
+            packs.push(Box::new(local::ArchivePack::open_archive(archive)?));
+        }
+        Ok((
+            Self::from_packs(packs),
+            ManagerUI {
+                progress_ui: vec![],
+                num_tasks: 0,
+            },
+        ))
+    }
+
+    pub fn add_archive_pack(&mut self, archive: &path::Path) -> io::Result<()> {
+        self.add_pack(Box::new(local::ArchivePack::open_archive(archive)?));
+        Ok(())
     }
 
     /// Returns the 'version' of the manager. The version is
@@ -325,20 +377,25 @@ impl Manager {
     }
 
     fn preload_assets(&mut self, path: String) {
-        self.packs.insert(1, Box::new(ObjectPack::new(path)));
+        self.packs.insert(
+            1,
+            Box::new(
+                local::IndexedPack::from_index(path::Path::new(&path))
+                    .expect("Could not open asset index"),
+            ),
+        );
         self.version += 1;
     }
 
     fn load_assets(&mut self) {
         self.packs.insert(
             1,
-            Box::new(ObjectPack::new(
-                paths::get_data_dir()
-                    .join(format!("index/{}.json", ASSET_VERSION))
-                    .to_str()
-                    .unwrap()
-                    .to_string(),
-            )),
+            Box::new(
+                local::IndexedPack::from_index(
+                    &paths::get_data_dir().join(format!("index/{}.json", ASSET_VERSION)),
+                )
+                .expect("Could not open downloaded asset index"),
+            ),
         );
         self.version += 1;
     }
@@ -593,47 +650,6 @@ impl Pack for InternalPack {
         match internal::get_file(name) {
             Some(val) => Some(Box::new(io::Cursor::new(val))),
             None => None,
-        }
-    }
-}
-
-struct ObjectPack {
-    objects: HashMap<String, String, BuildHasherDefault<FNVHash>>,
-}
-
-impl ObjectPack {
-    fn new(loc: String) -> ObjectPack {
-        let location = path::Path::new(&loc);
-        let file = fs::File::open(location).unwrap();
-        let index: serde_json::Value = serde_json::from_reader(&file).unwrap();
-        let objects = index.get("objects").and_then(|v| v.as_object()).unwrap();
-        let mut hash_objs = HashMap::with_hasher(BuildHasherDefault::default());
-        for (k, v) in objects {
-            hash_objs.insert(
-                k.clone(),
-                v.get("hash").and_then(|v| v.as_str()).unwrap().to_owned(),
-            );
-        }
-        ObjectPack { objects: hash_objs }
-    }
-}
-
-impl Pack for ObjectPack {
-    fn open(&self, name: &str) -> Option<Box<dyn io::Read>> {
-        if !name.starts_with("assets/") {
-            return None;
-        }
-        let name = &name["assets/".len()..];
-        if let Some(hash) = self.objects.get(name) {
-            let root_location = path::Path::new("./objects/");
-            let hash_path = format!("{}/{}", &hash[..2], hash);
-            let location = root_location.join(hash_path);
-            match fs::File::open(location) {
-                Ok(val) => Some(Box::new(val)),
-                Err(_) => None,
-            }
-        } else {
-            None
         }
     }
 }

@@ -376,7 +376,7 @@ impl std::fmt::Display for ModelVariant {
                         block::StateType::Enum => format!("{}.as_string()", prop.get_safe_name()),
                         _ => format!("&{}.to_string()", prop.get_safe_name()),
                     };
-                    writeln!(f, "                \"{}\" => val.contains({var}),", prop.name)?;
+                    writeln!(f, "                \"{}\" => val.split('|').any(|alternative| alternative == {var}),", prop.name)?;
                 }
                 writeln!(f, "                _ => false,")?;
                 write!(f, "            }}")

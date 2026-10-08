@@ -13,7 +13,7 @@ pub struct ChunkSection {
     pub cull_info: chunk_builder::CullInfo,
     pub render_buffer: Arc<RwLock<render::ChunkBuffer>>,
 
-    pub(crate) y: u8,
+    pub(crate) y: i32,
 
     pub(crate) blocks: storage::BlockStorage,
 
@@ -25,7 +25,7 @@ pub struct ChunkSection {
 }
 
 impl ChunkSection {
-    pub(crate) fn new(y: u8, fill_sky: bool) -> Self {
+    pub(crate) fn new(y: i32, fill_sky: bool) -> Self {
         let sky_light = if fill_sky {
             nibble::Array::new_def(16 * 16 * 16, 0xF)
         } else {
@@ -94,7 +94,7 @@ impl ChunkSection {
 
 #[derive(Clone)]
 pub struct ChunkSectionSnapshot {
-    pub y: u8,
+    pub y: i32,
     pub blocks: storage::BlockStorage,
     pub block_light: nibble::Array,
     pub sky_light: nibble::Array,
@@ -152,15 +152,14 @@ impl ChunkSectionSnapshotGroup {
                 let chunk = chunks.get(&CPos(x + xo, z + zo));
                 for yo in -1..2 {
                     let section = if let Some(chunk) = chunk {
-                        if y + yo != (y + yo) & 15 {
+                        if chunk.section_index(y + yo).is_none() {
                             None
+                        } else if let Some(section) = chunk.section(y + yo) {
+                            Some(section.capture_snapshot(chunk.biomes))
                         } else {
-                            let section = &chunk.sections[(y + yo) as usize].as_ref();
-                            if let Some(section) = section {
-                                Some(section.capture_snapshot(chunk.biomes))
-                            } else {
-                                Some(EMPTY_SECTION.clone())
-                            }
+                            let mut empty = EMPTY_SECTION.clone();
+                            empty.y = y + yo;
+                            Some(empty)
                         }
                     } else {
                         None

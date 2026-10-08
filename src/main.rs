@@ -18,6 +18,7 @@
 #![allow(clippy::float_cmp)] // float comparison used to check if changed
 
 mod console;
+mod native_probe;
 use arc_swap::ArcSwapOption;
 use atomic_float::AtomicF64;
 use copypasta::nop_clipboard;
@@ -300,6 +301,22 @@ struct Opt {
     assets_dir: Option<String>,
     #[structopt(long)]
     client_jar: Option<String>,
+
+    /// Separate writable settings, data and cache directory
+    #[structopt(long, parse(from_os_str))]
+    profile_dir: Option<std::path::PathBuf>,
+
+    /// Read-only local resource archives in low-to-high priority order
+    #[structopt(long, parse(from_os_str))]
+    resource_pack_archive: Vec<std::path::PathBuf>,
+
+    /// Headless development check of the native 1.21.1 world on a local reference server
+    #[structopt(long, requires = "block-catalog")]
+    verify_native_world: Option<std::net::SocketAddr>,
+
+    /// Exact blocks.json from the local 1.21.1 server data generator
+    #[structopt(long, parse(from_os_str), requires = "verify-native-world")]
+    block_catalog: Option<std::path::PathBuf>,
 }
 
 // TODO: Hide own character and show only the right hand. (with an item)
@@ -312,6 +329,22 @@ struct Opt {
 // TODO: Fix pistons.
 fn main() {
     let opt = Opt::from_args();
+    if let Some(address) = opt.verify_native_world {
+        match native_probe::run(address, opt.block_catalog.as_deref().unwrap()) {
+            Ok(report) => println!("{}", serde_json::to_string_pretty(&report).unwrap()),
+            Err(error) => {
+                eprintln!("Native world verification failed: {}", error);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+    if let Some(profile) = opt.profile_dir.clone() {
+        if let Err(error) = paths::set_profile_dir(profile) {
+            eprintln!("Could not initialize isolated Leafish profile: {}", error);
+            std::process::exit(1);
+        }
+    }
     #[allow(clippy::arc_with_non_send_sync)]
     let con = Arc::new(Mutex::new(console::Console::new()));
     let proxy = console::ConsoleProxy::new(con.clone());
@@ -328,13 +361,19 @@ fn main() {
     con.lock().configure(&settings);
     let vsync = settings.get_bool(BoolSetting::Vsync);
 
-    let (res, mut resui) = resources::Manager::new(
+    let (mut res, mut resui) = resources::Manager::new(
         opt.assets_dir
             .clone()
             .zip(opt.asset_index.clone())
             .map(|(dir, idx)| format!("{}/indexes/{}.json", dir, idx)),
         opt.client_jar.clone(),
     );
+    for archive in &opt.resource_pack_archive {
+        if let Err(error) = res.add_archive_pack(archive) {
+            eprintln!("Could not mount local resource archive: {}", error);
+            std::process::exit(1);
+        }
+    }
     let resource_manager = Arc::new(RwLock::new(res));
 
     let events_loop = winit::event_loop::EventLoop::new().unwrap();

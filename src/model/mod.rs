@@ -1,3 +1,4 @@
+pub mod definition;
 pub mod liquid;
 
 use crate::render;
@@ -6,9 +7,10 @@ use crate::shared::Direction;
 use crate::world;
 use crate::world::block::{Block, TintType};
 use byteorder::{NativeEndian, WriteBytesExt};
+use leafish_blocks::catalog::NamedState;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::sync::Arc;
 
 use crate::types::hash::FNVHash;
@@ -17,7 +19,6 @@ use std::hash::BuildHasherDefault;
 
 use image::GenericImageView;
 use parking_lot::RwLock;
-use rand::seq::SliceRandom;
 use rand::Rng;
 
 pub struct Factory {
@@ -32,6 +33,18 @@ pub struct Factory {
 
 #[derive(PartialEq, Eq, Hash, Clone)]
 struct Key(String, String);
+
+fn read_asset_json(reader: impl Read) -> Result<serde_json::Value, String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(4 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > 4 * 1024 * 1024 {
+        return Err("model JSON exceeds size bound".into());
+    }
+    serde_json::from_slice(&bytes).map_err(|error| error.to_string())
+}
 
 macro_rules! try_log {
     ($e:expr) => {
@@ -145,28 +158,40 @@ impl Factory {
     }
 
     fn eval_rules(block: Block, rules: &[Rule]) -> bool {
-        for mrule in rules {
-            match *mrule {
-                Rule::Or(ref sub_rules) => {
-                    let mut ok = false;
-                    for srule in sub_rules {
-                        if Self::eval_rules(block, srule) {
-                            ok = true;
-                            break;
-                        }
-                    }
-                    if !ok {
-                        return false;
-                    }
-                }
-                Rule::Match(ref key, ref val) => {
-                    if !block.match_multipart(key, val) {
-                        return false;
-                    }
-                }
+        rules
+            .iter()
+            .all(|rule| rule.matches_with(&|key, value| block.match_multipart(key, value)))
+    }
+
+    /// Resolve and select the installed model for an exact catalog state.
+    /// Errors stay explicit; no missing-block or air identity is substituted.
+    /// The handle contains baked geometry, not collision or gameplay behavior.
+    pub fn get_named_state_model<R: Rng>(
+        models: &Arc<RwLock<Factory>>,
+        state: &NamedState,
+        rng: &mut R,
+    ) -> Result<NamedStateModel, String> {
+        let key = Key(state.namespace().to_owned(), state.path().to_owned());
+        {
+            let factory = models.read();
+            if let Some(model) = factory.models.get(&key) {
+                return model.select_named(state, rng);
             }
         }
-        true
+        let mut factory = models.write();
+        if !factory.models.contains_key(&key)
+            && !factory.load_model(state.namespace(), state.path())
+        {
+            return Err(format!(
+                "could not load exact named-state model for {}",
+                state.name()
+            ));
+        }
+        factory
+            .models
+            .get(&key)
+            .ok_or("model was not loaded")?
+            .select_named(state, rng)
     }
 
     pub fn get_state_model<R: Rng, W: Write>(
@@ -204,11 +229,12 @@ impl Factory {
         if !missing_variant {
             // Still no model, replace with placeholder
             let mut m = models.write();
-            let model = m
+            let mut model = m
                 .models
                 .get(&Key("leafish".to_owned(), "missing_block".to_owned()))
                 .unwrap()
                 .clone();
+            model.legacy_fallback = true;
             m.models.insert(key, model);
         }
         ret
@@ -226,14 +252,26 @@ impl Factory {
                 return false;
             }
         };
-        let mdl: serde_json::Value = try_log!(serde_json::from_reader(file));
+        let mdl = try_log!(read_asset_json(file));
+        if !mdl.is_object() || mdl.get("variants").is_some() == mdl.get("multipart").is_some() {
+            return false;
+        }
+        if mdl.get("variants").is_some_and(|value| !value.is_object())
+            || mdl.get("multipart").is_some_and(|value| !value.is_array())
+        {
+            return false;
+        }
 
         let mut model = StateModel {
             variants: HashMap::with_hasher(BuildHasherDefault::default()),
             multipart: vec![],
+            legacy_fallback: false,
         };
 
         if let Some(variants) = mdl.get("variants").and_then(|v| v.as_object()) {
+            if variants.is_empty() || variants.len() > 65536 {
+                return false;
+            }
             for (k, v) in variants {
                 let vars = self.parse_model_list(plugin, v);
                 if vars.models.is_empty() {
@@ -243,11 +281,26 @@ impl Factory {
             }
         }
         if let Some(multipart) = mdl.get("multipart").and_then(|v| v.as_array()) {
+            if multipart.len() > 4096 {
+                return false;
+            }
             for rule in multipart {
-                let apply = self.parse_model_list(plugin, rule.get("apply").unwrap());
+                let Some(application) = rule.get("apply") else {
+                    return false;
+                };
+                let apply = self.parse_model_list(plugin, application);
+                if apply.models.is_empty() {
+                    return false;
+                }
                 let mut rules = vec![];
-                if let Some(when) = rule.get("when").and_then(|v| v.as_object()) {
-                    Self::parse_rules(when, &mut rules);
+                if let Some(when) = rule.get("when") {
+                    match definition::Condition::parse(when) {
+                        Ok(condition) => rules.push(condition),
+                        Err(message) => {
+                            error!("Invalid multipart condition: {}", message);
+                            return false;
+                        }
+                    }
                 }
                 model.multipart.push(MultipartRule { apply, rules })
             }
@@ -258,34 +311,17 @@ impl Factory {
         true
     }
 
-    fn parse_rules(when: &serde_json::Map<String, serde_json::Value>, rules: &mut Vec<Rule>) {
-        for (name, val) in when {
-            if name == "OR" {
-                let mut or_rules = vec![];
-                for sub in val.as_array().unwrap() {
-                    let mut sub_rules = vec![];
-                    Self::parse_rules(sub.as_object().unwrap(), &mut sub_rules);
-                    or_rules.push(sub_rules);
-                }
-                rules.push(Rule::Or(or_rules));
-            } else {
-                let v = match *val {
-                    serde_json::Value::Bool(ref v) => v.to_string(),
-                    serde_json::Value::Number(ref v) => v.to_string(),
-                    serde_json::Value::String(ref v) => v.to_owned(),
-                    _ => unreachable!(),
-                };
-                rules.push(Rule::Match(name.to_owned(), v));
-            }
-        }
-    }
-
     fn parse_model_list(&self, plugin: &str, v: &serde_json::Value) -> Variants {
         let mut variants = Variants { models: vec![] };
         if let Some(list) = v.as_array() {
+            if list.is_empty() || list.len() > 4096 {
+                return variants;
+            }
             for val in list {
                 if let Some(mdl) = self.parse_block_state_variant(plugin, val) {
                     variants.models.push(self.process_model(mdl));
+                } else {
+                    return Variants { models: vec![] };
                 }
             }
         } else if let Some(mdl) = self.parse_block_state_variant(plugin, v) {
@@ -303,88 +339,88 @@ impl Factory {
             }
         };
 
-        let filename = if let Some((_, model_name)) = model_name.split_once(':') {
-            format!("models/{}.json", model_name)
-        } else if model_name.starts_with("block/") {
-            format!("models/{}.json", &model_name)
+        let default_namespace = if plugin == "leafish" {
+            "leafish"
         } else {
-            format!("models/block/{}.json", model_name)
+            "minecraft"
         };
-
-        let file = match self.resources.read().open(plugin, &filename) {
-            Some(val) => val,
-            None => {
-                error!("Couldn't find model {}", filename);
+        let (namespace, path) = match definition::resource_location(model_name, default_namespace) {
+            Ok(id) => id,
+            Err(message) => {
+                error!("Invalid model reference: {}", message);
                 return None;
             }
         };
-        let block_model: serde_json::Value = try_log!(opt serde_json::from_reader(file));
-
-        let mut model = match self.parse_model(plugin, &block_model) {
-            Some(val) => val,
-            None => {
-                error!("Failed to parse model {}", filename);
+        // Older built-in Leafish resources predate the explicit block/ prefix.
+        let path = if plugin == "leafish" && !model_name.contains(':') && !path.contains('/') {
+            format!("block/{}", path)
+        } else {
+            path.to_owned()
+        };
+        let resolved = match definition::resolve_model(namespace, &path, &|namespace, path| {
+            let file = self
+                .resources
+                .read()
+                .open(namespace, &format!("models/{}.json", path))
+                .ok_or_else(|| format!("missing model {}:{}", namespace, path))?;
+            read_asset_json(file)
+        }) {
+            Ok(value) => value,
+            Err(message) => {
+                error!("Could not resolve model: {}", message);
                 return None;
             }
         };
-
+        let mut model = self.parse_model(&resolved)?;
+        for axis in ["x", "y"] {
+            if let Some(rotation) = v.get(axis) {
+                if !rotation
+                    .as_u64()
+                    .is_some_and(|value| [0, 90, 180, 270].contains(&value))
+                {
+                    error!("Invalid model application rotation");
+                    return None;
+                }
+            }
+        }
+        if v.get("uvlock").is_some_and(|value| !value.is_boolean()) {
+            return None;
+        }
         model.y = v.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
         model.x = v.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
         model.uvlock = v.get("uvlock").and_then(|v| v.as_bool()).unwrap_or(false);
-        model.weight = v.get("weight").and_then(|v| v.as_f64()).unwrap_or(1.0);
+        model.weight = match definition::application_weight(v) {
+            Ok(weight) => weight,
+            Err(message) => {
+                error!("Invalid model weight: {}", message);
+                return None;
+            }
+        };
         Some(model)
     }
 
-    fn parse_model(&self, plugin: &str, v: &serde_json::Value) -> Option<RawModel> {
-        let parent = v.get("parent").and_then(|v| v.as_str()).unwrap_or("");
-        let mut model = if !parent.is_empty() && !parent.starts_with("builtin/") {
-            let parent = match parent.split_once(':') {
-                Some(parent) => parent.1,
-                None => parent,
-            };
-            let file = match self
-                .resources
-                .read()
-                .open(plugin, &format!("models/{}.json", parent))
-            {
-                Some(val) => val,
-                None => {
-                    error!("Couldn't find model {}", format!("models/{}.json", parent));
-                    return None;
-                }
-            };
-            let block_model: serde_json::Value = try_log!(opt serde_json::from_reader(file));
-            match self.parse_model(plugin, &block_model) {
-                Some(val) => val,
-                None => {
-                    error!(
-                        "Failed to parse model {}",
-                        format!("models/{}.json", parent)
-                    );
-                    return None;
-                }
-            }
-        } else {
-            RawModel {
-                texture_vars: HashMap::with_hasher(BuildHasherDefault::default()),
-                elements: vec![],
-                ambient_occlusion: true,
-                ao_set: false,
-
-                x: 0.0,
-                y: 0.0,
-                uvlock: false,
-                weight: 1.0,
-
-                display: HashMap::with_hasher(BuildHasherDefault::default()),
-                builtin: match parent {
-                    "builtin/generated" => BuiltinType::Generated,
-                    "builtin/entity" => BuiltinType::Entity,
-                    "builtin/compass" => BuiltinType::Compass,
-                    "builtin/clock" => BuiltinType::Clock,
-                    _ => BuiltinType::False,
-                },
-            }
+    fn parse_model(&self, v: &serde_json::Value) -> Option<RawModel> {
+        if let Err(message) = definition::validate_model(v) {
+            error!("Invalid resolved model: {}", message);
+            return None;
+        }
+        let mut model = RawModel {
+            texture_vars: HashMap::with_hasher(BuildHasherDefault::default()),
+            elements: vec![],
+            ambient_occlusion: true,
+            ao_set: false,
+            x: 0.0,
+            y: 0.0,
+            uvlock: false,
+            weight: 1,
+            display: HashMap::with_hasher(BuildHasherDefault::default()),
+            builtin: match v.get("parent").and_then(|v| v.as_str()).unwrap_or("") {
+                "builtin/generated" => BuiltinType::Generated,
+                "builtin/entity" => BuiltinType::Entity,
+                "builtin/compass" => BuiltinType::Compass,
+                "builtin/clock" => BuiltinType::Clock,
+                _ => BuiltinType::False,
+            },
         };
 
         if let Some(textures) = v.get("textures").and_then(|v| v.as_object()) {
@@ -437,7 +473,7 @@ impl Factory {
                     ]
                 })
                 .unwrap(),
-            shade: v.get("shade").and_then(|v| v.as_bool()).unwrap_or(false),
+            shade: v.get("shade").and_then(|v| v.as_bool()).unwrap_or(true),
             faces: [None, None, None, None, None, None],
             rotation: None,
         };
@@ -483,13 +519,7 @@ impl Factory {
                         texture: face
                             .get("texture")
                             .and_then(|v| v.as_str())
-                            .map(|v| {
-                                if v.starts_with('#') {
-                                    v.to_owned()
-                                } else {
-                                    "#".to_owned() + v
-                                }
-                            })
+                            .map(str::to_owned)
                             .unwrap(),
                         cull_face: Direction::from_string(
                             face.get("cullface")
@@ -826,11 +856,154 @@ fn rotate_direction(
 pub struct StateModel {
     variants: HashMap<String, Variants, BuildHasherDefault<FNVHash>>,
     multipart: Vec<MultipartRule>,
+    legacy_fallback: bool,
 }
 
 impl StateModel {
     pub fn get_variants(&self, name: &str) -> Option<&Variants> {
         self.variants.get(name).or_else(|| self.variants.get(""))
+    }
+
+    fn select_named<R: Rng>(
+        &self,
+        state: &NamedState,
+        rng: &mut R,
+    ) -> Result<NamedStateModel, String> {
+        if self.legacy_fallback {
+            return Err("legacy missing-model fallback is not an exact named-state model".into());
+        }
+        let mut selected: Option<Model> = None;
+        if !self.variants.is_empty() {
+            let mut matching = None;
+            for (selector, variants) in &self.variants {
+                if definition::variant_matches(selector, state.properties())? {
+                    if matching.is_some() {
+                        return Err("ambiguous named-state model variant".into());
+                    }
+                    matching = Some(variants);
+                }
+            }
+            let variants = matching.ok_or("no model variant for exact named state")?;
+            selected = Some(variants.choose_model(rng).clone());
+        } else {
+            for part in &self.multipart {
+                if part
+                    .rules
+                    .iter()
+                    .all(|rule| rule.matches(state.properties()))
+                {
+                    let part = part.apply.choose_model(rng);
+                    if let Some(model) = &mut selected {
+                        model.join(part);
+                    } else {
+                        selected = Some(part.clone());
+                    }
+                }
+            }
+        }
+        // An unmatched multipart state can intentionally have no visible faces.
+        Ok(NamedStateModel {
+            state_id: state.id(),
+            model: selected.unwrap_or(Model {
+                faces: vec![],
+                ambient_occlusion: true,
+                weight: 1,
+            }),
+        })
+    }
+}
+
+/// Selected geometry preserves the catalog state ID. Empty geometry does not
+/// imply air: block entities and custom renderers require separate behavior.
+pub struct NamedStateModel {
+    state_id: u32,
+    model: Model,
+}
+
+impl NamedStateModel {
+    pub fn state_id(&self) -> u32 {
+        self.state_id
+    }
+    pub fn face_count(&self) -> usize {
+        self.model.faces.len()
+    }
+    pub fn vertex_count(&self) -> usize {
+        self.model
+            .faces
+            .iter()
+            .map(|face| face.vertices.len())
+            .sum()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.model.faces.is_empty()
+    }
+}
+
+#[cfg(test)]
+mod state_model_tests {
+    use super::*;
+    use rand::SeedableRng;
+
+    #[test]
+    fn weighted_choices_respect_unequal_weights() {
+        let variants = Variants {
+            models: vec![
+                Model {
+                    faces: vec![],
+                    ambient_occlusion: false,
+                    weight: 1,
+                },
+                Model {
+                    faces: vec![],
+                    ambient_occlusion: true,
+                    weight: 9,
+                },
+            ],
+        };
+        let mut rng = rand_pcg::Pcg32::seed_from_u64(721);
+        let heavy = (0..1000)
+            .filter(|_| variants.choose_model(&mut rng).ambient_occlusion)
+            .count();
+        assert!(
+            (830..970).contains(&heavy),
+            "weighted selections: {}",
+            heavy
+        );
+    }
+
+    #[test]
+    fn named_selection_preserves_state_and_rejects_missing_variant() {
+        let catalog = leafish_blocks::catalog::StateCatalog::from_json(br#"{"fixture:block":{"properties":{"axis":["x","y"]},"states":[{"id":0,"properties":{"axis":"x"},"default":true},{"id":1,"properties":{"axis":"y"}}]}}"#).unwrap();
+        let mut model = StateModel {
+            variants: HashMap::with_hasher(BuildHasherDefault::default()),
+            multipart: vec![],
+            legacy_fallback: false,
+        };
+        model.variants.insert(
+            "axis=x".into(),
+            Variants {
+                models: vec![Model {
+                    faces: vec![],
+                    ambient_occlusion: true,
+                    weight: 1,
+                }],
+            },
+        );
+        let mut rng = rand_pcg::Pcg32::seed_from_u64(7);
+        assert_eq!(
+            model
+                .select_named(catalog.state(0).unwrap(), &mut rng)
+                .unwrap()
+                .state_id(),
+            0
+        );
+        assert!(model
+            .select_named(catalog.state(1).unwrap(), &mut rng)
+            .is_err());
+        model.legacy_fallback = true;
+        assert!(model
+            .select_named(catalog.state(0).unwrap(), &mut rng)
+            .is_err());
     }
 }
 
@@ -840,11 +1013,7 @@ struct MultipartRule {
     rules: Vec<Rule>,
 }
 
-#[derive(Clone)]
-enum Rule {
-    Match(String, String),
-    Or(Vec<Vec<Rule>>),
-}
+type Rule = definition::Condition;
 
 #[derive(Clone)]
 pub struct Variants {
@@ -853,8 +1022,15 @@ pub struct Variants {
 
 impl Variants {
     fn choose_model<R: Rng>(&self, rng: &mut R) -> &Model {
-        // TODO: Weighted random
-        self.models.choose(rng).unwrap()
+        let total: u64 = self.models.iter().map(|model| model.weight as u64).sum();
+        let mut choice = rng.gen_range(0..total);
+        for model in &self.models {
+            if choice < model.weight as u64 {
+                return model;
+            }
+            choice -= model.weight as u64;
+        }
+        unreachable!("bounded weighted choice is inside the model list")
     }
 }
 
@@ -877,7 +1053,7 @@ struct RawModel {
     x: f64,
     y: f64,
     uvlock: bool,
-    weight: f64,
+    weight: u32,
     #[allow(dead_code)]
     display: HashMap<String, ModelDisplay, BuildHasherDefault<FNVHash>>,
     #[allow(dead_code)]
@@ -886,15 +1062,13 @@ struct RawModel {
 
 impl RawModel {
     fn lookup_texture(&self, name: &str) -> String {
-        if !name.is_empty() && name.starts_with('#') {
-            let tex = self
-                .texture_vars
-                .get(&name[1..])
-                .cloned()
-                .unwrap_or_else(|| "".to_owned());
-            return self.lookup_texture(&tex);
-        }
-        name.to_owned()
+        let variables = self
+            .texture_vars
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::Value::String(value.clone())))
+            .collect();
+        // Resolution validated every face before baking; bounded again here.
+        definition::resolve_texture(&variables, name).expect("validated model texture")
     }
 }
 
@@ -939,7 +1113,7 @@ struct Model {
     faces: Vec<Face>,
     ambient_occlusion: bool,
     #[allow(dead_code)]
-    weight: f64,
+    weight: u32,
 }
 
 #[derive(Clone, Debug)]

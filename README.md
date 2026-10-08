@@ -13,7 +13,11 @@ independent fixtures produced by Minecraft's own encoder. An independent saved-w
 comparison matched all 4,423,680 block-state values and 69,120 biome values from
 those 45 chunks.
 
-The Windows client builds, and 52 protocol tests pass. Many Play packets remain
+The Windows client builds, and 55 protocol tests pass. The client now has tested
+signed-height storage, an exact runtime state catalog, a bounded native network
+adapter, and read-only local asset mounting. Modern model selection preserves
+namespaces, multipart conditions, parent overrides and direct texture references.
+These components are still being connected to the graphical game. Many Play packets remain
 observed but unimplemented; these results do not establish playable 1.21.1
 support. See the port notes for the separate known legacy test failure.
 

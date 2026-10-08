@@ -232,6 +232,22 @@ impl ChunkWithLight {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct PlayerAbilities {
+    pub invulnerable: bool,
+    pub flying: bool,
+    pub may_fly: bool,
+    pub instant_build: bool,
+    pub flying_speed: f32,
+    pub walking_speed: f32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BlockUpdate {
+    pub position: [i32; 3],
+    pub state_id: u32,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum Clientbound {
     BundleDelimiter,
     Join(JoinGame),
@@ -250,6 +266,9 @@ pub enum Clientbound {
     },
     BatchStart,
     BatchFinished(u32),
+    Abilities(PlayerAbilities),
+    BlockUpdates(Vec<BlockUpdate>),
+    BlockActionAcknowledged(i32),
     CustomPayload {
         id: String,
         data: Vec<u8>,
@@ -271,6 +290,14 @@ pub fn decode_clientbound767(
     let mut r = Reader::new(payload)?;
     let packet = match id {
         0x00 => Clientbound::BundleDelimiter,
+        0x05 => Clientbound::BlockActionAcknowledged(r.nonnegative()? as i32),
+        0x09 => {
+            let ctx = context.ok_or(PlayError::Invalid("block update before dimension"))?;
+            let position = unpack_block_position(r.i64()?);
+            let state_id = r.nonnegative()?;
+            validate_block_update(position, state_id, ctx)?;
+            Clientbound::BlockUpdates(vec![BlockUpdate { position, state_id }])
+        }
         0x0c => Clientbound::BatchFinished(r.nonnegative()?),
         0x0d => Clientbound::BatchStart,
         0x19 => {
@@ -348,6 +375,22 @@ pub fn decode_clientbound767(
         }
         0x2b => Clientbound::Join(read_join(&mut r)?),
         0x35 => Clientbound::Ping(r.i32()?),
+        0x38 => {
+            let flags = r.u8()?;
+            let flying_speed = r.f32()?;
+            let walking_speed = r.f32()?;
+            if flags & !15 != 0 || flying_speed < 0.0 || walking_speed < 0.0 {
+                return Err(PlayError::Invalid("player abilities"));
+            }
+            Clientbound::Abilities(PlayerAbilities {
+                invulnerable: flags & 1 != 0,
+                flying: flags & 2 != 0,
+                may_fly: flags & 4 != 0,
+                instant_build: flags & 8 != 0,
+                flying_speed,
+                walking_speed,
+            })
+        }
         0x40 => {
             let position = [r.f64()?, r.f64()?, r.f64()?];
             let rotation = [r.f32()?, r.f32()?];
@@ -364,6 +407,40 @@ pub fn decode_clientbound767(
             })
         }
         0x47 => return Err(PlayError::Invalid("respawn not yet implemented")),
+        0x49 => {
+            let ctx = context.ok_or(PlayError::Invalid("section update before dimension"))?;
+            let packed = r.i64()?;
+            let section = [
+                (packed >> 42) as i32,
+                (packed << 44 >> 44) as i32,
+                (packed << 22 >> 42) as i32,
+            ];
+            let count = r.count(4096, "section block updates")?;
+            let mut updates = Vec::with_capacity(count);
+            let mut seen = [false; 4096];
+            for _ in 0..count {
+                let entry = r.varlong()?;
+                let local = (entry & 4095) as usize;
+                let state = entry >> 12;
+                if state > u32::MAX as u64 || seen[local] {
+                    return Err(PlayError::Invalid(
+                        "section update identity or duplicate position",
+                    ));
+                }
+                seen[local] = true;
+                let position = [
+                    section[0] * 16 + ((local >> 8) & 15) as i32,
+                    section[1] * 16 + (local & 15) as i32,
+                    section[2] * 16 + ((local >> 4) & 15) as i32,
+                ];
+                validate_block_update(position, state as u32, ctx)?;
+                updates.push(BlockUpdate {
+                    position,
+                    state_id: state as u32,
+                });
+            }
+            Clientbound::BlockUpdates(updates)
+        }
         0x69 => Clientbound::StartConfiguration,
         id if id >= 0 => Clientbound::Unhandled {
             packet_id: id,
@@ -373,6 +450,41 @@ pub fn decode_clientbound767(
     };
     r.finish()?;
     Ok(packet)
+}
+
+fn unpack_block_position(value: i64) -> [i32; 3] {
+    [
+        (value >> 38) as i32,
+        (value << 52 >> 52) as i32,
+        (value << 26 >> 38) as i32,
+    ]
+}
+
+fn pack_block_position(position: [i32; 3]) -> Result<i64> {
+    let [x, y, z] = position;
+    if !(-33_554_432..=33_554_431).contains(&x)
+        || !(-2048..=2047).contains(&y)
+        || !(-33_554_432..=33_554_431).contains(&z)
+    {
+        return Err(PlayError::Invalid("packed block position bounds"));
+    }
+    Ok(
+        (((x as u64 & 0x3ffffff) << 38) | ((z as u64 & 0x3ffffff) << 12) | (y as u64 & 0xfff))
+            as i64,
+    )
+}
+
+fn validate_block_update(position: [i32; 3], state: u32, ctx: &WorldContext) -> Result<()> {
+    if state >= ctx.block_state_count
+        || position[1] < ctx.dimension.min_y
+        || position[1] >= ctx.dimension.min_y + ctx.dimension.height as i32
+    {
+        Err(PlayError::Invalid(
+            "block update outside registry or dimension",
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn read_join(r: &mut Reader<'_>) -> Result<JoinGame> {
@@ -476,10 +588,157 @@ pub enum Serverbound {
     KeepAlive(i64),
     Pong(i32),
     ChunkBatchReceived(f32),
+    MovePosition {
+        position: [f64; 3],
+        on_ground: bool,
+    },
+    MoveRotation {
+        rotation: [f32; 2],
+        on_ground: bool,
+    },
+    MoveStatus {
+        on_ground: bool,
+    },
+    Flying(bool),
+    PlayerCommand {
+        entity_id: i32,
+        action: u8,
+    },
+    Swing {
+        hand: u8,
+    },
+    SelectedSlot(u8),
+    /// Sequence allocation and acknowledgment tracking belong to the runtime.
+    PlayerAction {
+        action: u8,
+        position: [i32; 3],
+        face: u8,
+        sequence: i32,
+    },
+    UseItemOn {
+        hand: u8,
+        position: [i32; 3],
+        face: u8,
+        hit: [f32; 3],
+        inside: bool,
+        sequence: i32,
+    },
+    UseItem {
+        hand: u8,
+        sequence: i32,
+        rotation: [f32; 2],
+    },
 }
 pub fn encode_serverbound767(packet: &Serverbound) -> Result<(i32, Vec<u8>)> {
     let mut out = Vec::new();
     let id = match packet {
+        Serverbound::MovePosition {
+            position,
+            on_ground,
+        } => {
+            validate_position(*position)?;
+            for value in position {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            out.push(u8::from(*on_ground));
+            0x1a
+        }
+        Serverbound::MoveRotation {
+            rotation,
+            on_ground,
+        } => {
+            validate_rotation(*rotation)?;
+            for value in rotation {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            out.push(u8::from(*on_ground));
+            0x1c
+        }
+        Serverbound::MoveStatus { on_ground } => {
+            out.push(u8::from(*on_ground));
+            0x1d
+        }
+        Serverbound::Flying(flying) => {
+            out.push(if *flying { 2 } else { 0 });
+            0x23
+        }
+        Serverbound::PlayerCommand { entity_id, action } => {
+            if *action > 8 {
+                return Err(PlayError::Invalid("player command"));
+            }
+            push_varint(&mut out, *entity_id);
+            push_varint(&mut out, *action as i32);
+            push_varint(&mut out, 0);
+            0x25
+        }
+        Serverbound::Swing { hand } => {
+            validate_hand(*hand)?;
+            push_varint(&mut out, *hand as i32);
+            0x36
+        }
+        Serverbound::SelectedSlot(slot) => {
+            if *slot > 8 {
+                return Err(PlayError::Invalid("selected slot"));
+            }
+            out.extend_from_slice(&(*slot as i16).to_be_bytes());
+            0x2f
+        }
+        Serverbound::PlayerAction {
+            action,
+            position,
+            face,
+            sequence,
+        } => {
+            if *action > 6 || *face > 5 || *sequence < 0 {
+                return Err(PlayError::Invalid("player action"));
+            }
+            push_varint(&mut out, *action as i32);
+            out.extend_from_slice(&pack_block_position(*position)?.to_be_bytes());
+            out.push(*face);
+            push_varint(&mut out, *sequence);
+            0x24
+        }
+        Serverbound::UseItemOn {
+            hand,
+            position,
+            face,
+            hit,
+            inside,
+            sequence,
+        } => {
+            validate_hand(*hand)?;
+            if *face > 5 || *sequence < 0 || hit.iter().any(|v| !v.is_finite()) {
+                return Err(PlayError::Invalid("use item on block"));
+            }
+            push_varint(&mut out, *hand as i32);
+            out.extend_from_slice(&pack_block_position(*position)?.to_be_bytes());
+            push_varint(&mut out, *face as i32);
+            // Minecraft writes offsets verbatim; some block shapes extend
+            // outside a unit cube. The authoritative server validates reach.
+            for value in hit {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            out.push(u8::from(*inside));
+            push_varint(&mut out, *sequence);
+            0x38
+        }
+        Serverbound::UseItem {
+            hand,
+            sequence,
+            rotation,
+        } => {
+            validate_hand(*hand)?;
+            validate_rotation(*rotation)?;
+            if *sequence < 0 {
+                return Err(PlayError::Invalid("use item sequence"));
+            }
+            push_varint(&mut out, *hand as i32);
+            push_varint(&mut out, *sequence);
+            for value in rotation {
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            0x39
+        }
         Serverbound::AcceptTeleport(id) => {
             push_varint(&mut out, *id);
             0
@@ -504,9 +763,8 @@ pub fn encode_serverbound767(packet: &Serverbound) -> Result<(i32, Vec<u8>)> {
             rotation,
             on_ground,
         } => {
-            if position.iter().any(|v| !v.is_finite()) || rotation.iter().any(|v| !v.is_finite()) {
-                return Err(PlayError::Invalid("movement values"));
-            }
+            validate_position(*position)?;
+            validate_rotation(*rotation)?;
             for v in position {
                 out.extend_from_slice(&v.to_be_bytes());
             }
@@ -518,6 +776,31 @@ pub fn encode_serverbound767(packet: &Serverbound) -> Result<(i32, Vec<u8>)> {
         }
     };
     Ok((id, out))
+}
+
+pub fn validate_position(position: [f64; 3]) -> Result<()> {
+    if position
+        .iter()
+        .any(|v| !v.is_finite() || v.abs() > 30_000_000.0)
+    {
+        Err(PlayError::Invalid("movement position"))
+    } else {
+        Ok(())
+    }
+}
+pub fn validate_rotation(rotation: [f32; 2]) -> Result<()> {
+    if rotation.iter().any(|v| !v.is_finite()) {
+        Err(PlayError::Invalid("movement rotation"))
+    } else {
+        Ok(())
+    }
+}
+fn validate_hand(hand: u8) -> Result<()> {
+    if hand > 1 {
+        Err(PlayError::Invalid("interaction hand"))
+    } else {
+        Ok(())
+    }
 }
 
 /// Session ordering and exact numeric chunk storage, reusable by a future client
@@ -631,6 +914,11 @@ impl PlaySession {
                 self.last_keepalive = Some(value);
             }
             Clientbound::Ping(value) => responses.push(Serverbound::Pong(value)),
+            // The runtime emits these authoritative events. No speculative
+            // mutation is applied to the retained wire-chunk snapshots here.
+            Clientbound::Abilities(_)
+            | Clientbound::BlockUpdates(_)
+            | Clientbound::BlockActionAcknowledged(_) => {}
             Clientbound::BatchStart => {
                 if self.join.is_none() || self.current_batch.is_some() {
                     return Err(PlayError::Invalid("chunk batch start order"));
@@ -823,6 +1111,20 @@ impl<'a> Reader<'a> {
             Ok(v as u32)
         }
     }
+    fn varlong(&mut self) -> Result<u64> {
+        let mut value = 0u64;
+        for i in 0..10 {
+            let b = self.u8()?;
+            if i == 9 && b & 0xfe != 0 {
+                return Err(PlayError::Invalid("VarLong overflow"));
+            }
+            value |= ((b & 127) as u64) << (7 * i);
+            if b & 128 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(PlayError::Invalid("VarLong overflow"))
+    }
     fn count(&mut self, max: usize, label: &'static str) -> Result<usize> {
         let n = self.nonnegative()? as usize;
         if n > max {
@@ -908,6 +1210,141 @@ fn push_varint(out: &mut Vec<u8>, value: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn modern_movement_and_action_wire_fields_are_exact() {
+        assert_eq!(
+            encode_serverbound767(&Serverbound::Flying(true)).unwrap(),
+            (0x23, vec![2])
+        );
+        assert_eq!(
+            encode_serverbound767(&Serverbound::SelectedSlot(8)).unwrap(),
+            (0x2f, vec![0, 8])
+        );
+        assert_eq!(
+            encode_serverbound767(&Serverbound::MoveStatus { on_ground: true }).unwrap(),
+            (0x1d, vec![1])
+        );
+        let packet = Serverbound::PlayerAction {
+            action: 2,
+            position: [-1, -64, -2],
+            face: 5,
+            sequence: 300,
+        };
+        let (id, bytes) = encode_serverbound767(&packet).unwrap();
+        assert_eq!(id, 0x24);
+        assert_eq!(
+            bytes,
+            vec![2, 255, 255, 255, 255, 255, 255, 239, 192, 5, 172, 2]
+        );
+        let (id, bytes) = encode_serverbound767(&Serverbound::UseItem {
+            hand: 1,
+            sequence: 128,
+            rotation: [90.0, -45.0],
+        })
+        .unwrap();
+        assert_eq!(id, 0x39);
+        assert_eq!(bytes, vec![1, 128, 1, 66, 180, 0, 0, 194, 52, 0, 0]);
+        let (id, bytes) = encode_serverbound767(&Serverbound::UseItemOn {
+            hand: 0,
+            position: [0, -64, 0],
+            face: 1,
+            hit: [0.25, 1.0, 0.75],
+            inside: true,
+            sequence: 7,
+        })
+        .unwrap();
+        assert_eq!((id, bytes.len(), bytes[22], bytes[23]), (0x38, 24, 1, 7));
+        let (_, extended_shape) = encode_serverbound767(&Serverbound::UseItemOn {
+            hand: 0,
+            position: [0, 0, 0],
+            face: 1,
+            hit: [0.5, 1.5, 0.5],
+            inside: false,
+            sequence: 8,
+        })
+        .unwrap();
+        assert_eq!(&extended_shape[14..18], &1.5f32.to_be_bytes());
+        assert!(encode_serverbound767(&Serverbound::SelectedSlot(9)).is_err());
+        assert!(encode_serverbound767(&Serverbound::Swing { hand: 2 }).is_err());
+        assert!(pack_block_position([0, -2049, 0]).is_err());
+        for position in [
+            [-33_554_432, -2048, 33_554_431],
+            [33_554_431, 2047, -33_554_432],
+            [-1, -64, -2],
+        ] {
+            assert_eq!(
+                unpack_block_position(pack_block_position(position).unwrap()),
+                position
+            );
+        }
+    }
+    #[test]
+    fn authoritative_updates_preserve_signed_coords_and_reject_unknown_ids() {
+        let mut bytes = pack_block_position([-17, -63, 31])
+            .unwrap()
+            .to_be_bytes()
+            .to_vec();
+        push_varint(&mut bytes, 26000);
+        let expected = BlockUpdate {
+            position: [-17, -63, 31],
+            state_id: 26000,
+        };
+        assert_eq!(
+            decode_clientbound767(9, &bytes, Some(&context())).unwrap(),
+            Clientbound::BlockUpdates(vec![expected.clone()])
+        );
+        // SectionPos x=-2, y=-4, z=1; local short x=15,z=15,y=1.
+        let section = (((-2i64 as u64 & 0x3fffff) << 42) | (1 << 20) | 0xffffc) as i64;
+        let mut batch = section.to_be_bytes().to_vec();
+        batch.push(1);
+        let mut packed = (26000u64 << 12) | 0xff1;
+        while packed >= 128 {
+            batch.push((packed as u8 & 127) | 128);
+            packed >>= 7;
+        }
+        batch.push(packed as u8);
+        assert_eq!(
+            decode_clientbound767(0x49, &batch, Some(&context())).unwrap(),
+            Clientbound::BlockUpdates(vec![expected])
+        );
+        for end in 0..batch.len() {
+            assert!(decode_clientbound767(0x49, &batch[..end], Some(&context())).is_err());
+        }
+        let mut duplicate = batch.clone();
+        duplicate[8] = 2;
+        duplicate.extend_from_slice(&batch[9..]);
+        assert!(decode_clientbound767(0x49, &duplicate, Some(&context())).is_err());
+        bytes.truncate(8);
+        push_varint(&mut bytes, 26684);
+        assert!(decode_clientbound767(9, &bytes, Some(&context())).is_err());
+        assert!(decode_clientbound767(9, &bytes, None).is_err());
+    }
+    #[test]
+    fn abilities_and_ack_are_strict_and_no_implicit_flight_is_invented() {
+        let mut bytes = vec![5];
+        bytes.extend_from_slice(&0.05f32.to_be_bytes());
+        bytes.extend_from_slice(&0.1f32.to_be_bytes());
+        let abilities = match decode_clientbound767(0x38, &bytes, None).unwrap() {
+            Clientbound::Abilities(v) => v,
+            _ => panic!(),
+        };
+        assert!(
+            abilities.may_fly
+                && abilities.invulnerable
+                && !abilities.flying
+                && !abilities.instant_build
+        );
+        assert_eq!(
+            decode_clientbound767(5, &[0xac, 2], None).unwrap(),
+            Clientbound::BlockActionAcknowledged(300)
+        );
+        assert!(decode_clientbound767(5, &[255, 255, 255, 255, 15], None).is_err());
+        bytes[0] = 16;
+        assert!(decode_clientbound767(0x38, &bytes, None).is_err());
+        bytes[0] = 0;
+        bytes[1..5].copy_from_slice(&f32::NAN.to_be_bytes());
+        assert!(decode_clientbound767(0x38, &bytes, None).is_err());
+    }
     fn string(out: &mut Vec<u8>, s: &str) {
         push_varint(out, s.len() as i32);
         out.extend_from_slice(s.as_bytes());

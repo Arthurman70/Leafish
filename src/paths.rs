@@ -14,6 +14,29 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static PROFILE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Select a separate profile before any settings, logging, or caches are opened.
+pub fn set_profile_dir(path: PathBuf) -> std::io::Result<()> {
+    fs::create_dir_all(&path)?;
+    let path = path.canonicalize()?;
+    PROFILE_DIR.set(path).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "Leafish profile is already initialized",
+        )
+    })
+}
+
+fn profile_dir(kind: &str) -> Option<PathBuf> {
+    PROFILE_DIR.get().map(|root| {
+        let path = root.join(kind);
+        fs::create_dir_all(&path).expect("Could not create isolated profile directory");
+        path
+    })
+}
 
 fn get_dir(dirtype: Option<PathBuf>) -> PathBuf {
     match dirtype {
@@ -30,13 +53,22 @@ fn get_dir(dirtype: Option<PathBuf>) -> PathBuf {
 }
 
 pub fn get_config_dir() -> PathBuf {
+    if let Some(path) = profile_dir("config") {
+        return path;
+    }
     get_dir(dirs::config_dir())
 }
 
 pub fn get_cache_dir() -> PathBuf {
+    if let Some(path) = profile_dir("cache") {
+        return path;
+    }
     get_dir(dirs::cache_dir())
 }
 
 pub fn get_data_dir() -> PathBuf {
+    if let Some(path) = profile_dir("data") {
+        return path;
+    }
     get_dir(dirs::data_dir())
 }

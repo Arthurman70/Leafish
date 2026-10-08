@@ -73,6 +73,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use self::sun::SunModel;
 
+pub mod modern;
 pub mod plugin_messages;
 mod sun;
 pub mod target;

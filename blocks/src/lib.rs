@@ -10,6 +10,7 @@ use collision::Aabb3;
 use std::collections::HashMap;
 
 pub mod material;
+pub mod catalog;
 pub use self::material::Material;
 #[rustfmt::skip] mod blocks;
 #[rustfmt::skip] mod versions;
@@ -91,6 +92,16 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    #[test]
+    fn multipart_numeric_alternatives_are_whole_tokens() {
+        let block = Block::RedstoneWire { east: RedstoneSide::None, north: RedstoneSide::None,
+            south: RedstoneSide::None, west: RedstoneSide::None, power: 1 };
+        assert!(block.match_multipart("power", "1"));
+        assert!(block.match_multipart("power", "0|1|10"));
+        assert!(!block.match_multipart("power", "10"));
+        assert!(!block.match_multipart("power", "11|12"));
+    }
 
     // Spot check a few blocks across different versions, including the correctly recognized last supported block
     // TODO: comprehensive testing against https://github.com/PrismarineJS/minecraft-data/tree/master/data/pc

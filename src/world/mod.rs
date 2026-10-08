@@ -45,8 +45,11 @@ use leafish_protocol::protocol::{Serializable, VarInt};
 use std::sync::atomic::Ordering;
 
 pub mod biome;
+mod bounds;
+pub use bounds::{InvalidWorldBounds, WorldBounds};
 mod chunk;
 mod lighting;
+pub mod native;
 mod storage;
 
 #[derive(Clone, Debug)]
@@ -75,6 +78,7 @@ pub struct World {
     block_entity_actions: (Sender<BlockEntityAction>, Receiver<BlockEntityAction>),
 
     protocol_version: i32,
+    bounds: WorldBounds,
     pub modded_block_ids: ArcSwap<HashMap<usize, String>>,
     pub id_map: Arc<block::VanillaIDMap>,
 
@@ -83,11 +87,23 @@ pub struct World {
 
 impl World {
     pub fn new(protocol_version: i32, sender: Sender<LightUpdate>) -> Self {
+        Self::with_bounds(protocol_version, sender, WorldBounds::LEGACY)
+    }
+
+    /// Constructs empty world storage for a validated, negotiated dimension.
+    /// Select a fresh World when changing dimensions; bounds never reinterpret
+    /// already-loaded section offsets.
+    pub fn with_bounds(
+        protocol_version: i32,
+        sender: Sender<LightUpdate>,
+        bounds: WorldBounds,
+    ) -> Self {
         let id_map = Arc::new(block::VanillaIDMap::new(protocol_version));
         Self {
             chunks: Arc::new(Default::default()),
             lighting_cache: Arc::new(Default::default()),
             protocol_version,
+            bounds,
             modded_block_ids: ArcSwap::new(Arc::new(Default::default())),
             id_map,
             light_updates: sender,
@@ -95,6 +111,10 @@ impl World {
             block_entity_actions: unbounded(),
             dimension: ArcSwap::new(Arc::new(Default::default())),
         }
+    }
+
+    pub fn bounds(&self) -> WorldBounds {
+        self.bounds
     }
 
     pub fn reset(&self, protocol_version: i32) {
@@ -115,9 +135,14 @@ impl World {
     }
 
     fn set_block_raw(&self, pos: Position, b: block::Block) -> bool {
+        if !self.bounds.contains_y(pos.y) {
+            return false;
+        }
         let cpos = CPos(pos.x >> 4, pos.z >> 4);
         let mut chunks = self.chunks.write();
-        let chunk = chunks.entry(cpos).or_insert_with(|| Chunk::new(cpos));
+        let chunk = chunks
+            .entry(cpos)
+            .or_insert_with(|| Chunk::with_bounds(cpos, self.bounds));
         if chunk.set_block(pos.x & 0xF, pos.y, pos.z & 0xF, b) {
             if chunk.block_entities.contains_key(&pos) {
                 self.block_entity_actions
@@ -204,9 +229,14 @@ impl World {
     }
 
     pub(crate) fn set_block_light(&self, pos: Position, light: u8) {
+        if !self.bounds.contains_y(pos.y) {
+            return;
+        }
         let cpos = CPos(pos.x >> 4, pos.z >> 4);
         let mut chunks = self.chunks.write();
-        let chunk = chunks.entry(cpos).or_insert_with(|| Chunk::new(cpos));
+        let chunk = chunks
+            .entry(cpos)
+            .or_insert_with(|| Chunk::with_bounds(cpos, self.bounds));
         chunk.set_block_light(pos.x & 0xF, pos.y, pos.z & 0xF, light);
     }
 
@@ -218,9 +248,14 @@ impl World {
     }
 
     pub(crate) fn set_sky_light(&self, pos: Position, light: u8) {
+        if !self.bounds.contains_y(pos.y) {
+            return;
+        }
         let cpos = CPos(pos.x >> 4, pos.z >> 4);
         let mut chunks = self.chunks.write();
-        let chunk = chunks.entry(cpos).or_insert_with(|| Chunk::new(cpos));
+        let chunk = chunks
+            .entry(cpos)
+            .or_insert_with(|| Chunk::with_bounds(cpos, self.bounds));
         chunk.set_sky_light(pos.x & 0xF, pos.y, pos.z & 0xF, light);
     }
 
@@ -285,8 +320,7 @@ impl World {
     #[allow(dead_code)]
     pub(crate) fn do_light_update(&self, update: LightUpdate) {
         use std::cmp;
-        if update.pos.y < 0
-            || update.pos.y > 255
+        if !self.bounds.contains_y(update.pos.y)
             || !self.is_chunk_loaded(update.pos.x >> 4, update.pos.z >> 4)
         {
             return;
@@ -348,7 +382,9 @@ impl World {
                     for zz in 0..16 {
                         data[(((c.position.0 << 4) as usize + xx) & 0x1FF)
                             + ((((c.position.1 << 4) as usize + zz) & 0x1FF) << 9)] =
-                            c.heightmap[(zz << 4) | xx];
+                            // Compatibility projection for the existing 8-bit cloud
+                            // texture only. The world and snapshots retain signed heights.
+                            c.heightmap[(zz << 4) | xx].clamp(0, 255) as u8;
                     }
                 }
             }
@@ -370,14 +406,16 @@ impl World {
 
         let camera = renderer.camera.lock();
         let start = (
-            ((camera.pos.x as i32) >> 4),
-            ((camera.pos.y as i32) >> 4),
-            ((camera.pos.z as i32) >> 4),
+            ((camera.pos.x.floor() as i32) >> 4),
+            self.bounds
+                .clamp_section_y((camera.pos.y.floor() as i32) >> 4),
+            ((camera.pos.z.floor() as i32) >> 4),
         );
         drop(camera);
 
         let render_queue = Arc::new(RwLock::new(Vec::new()));
-        let mut process_queue = VecDeque::with_capacity(self.chunks.read().len() * 16);
+        let mut process_queue =
+            VecDeque::with_capacity(self.chunks.read().len() * self.bounds.section_count());
         // debug!("processqueue size {}", self.chunks.len() * 16);
         process_queue.push_front((Direction::Invalid, start));
         let _diff = Instant::now().duration_since(start_rec);
@@ -526,7 +564,9 @@ impl World {
                     return;
                 }
                 if let Some(chunk) = self.chunks.write().get_mut(&CPos(pos.0, pos.2)) {
-                    chunk.sections_rendered_on[pos.1 as usize] = frame_id;
+                    if let Some(index) = chunk.section_index(pos.1) {
+                        chunk.sections_rendered_on[index] = frame_id;
+                    }
                 }
 
                 let min = cgmath::Point3::new(
@@ -585,7 +625,7 @@ impl World {
                 let chunks = self.chunks.read();
                 let chunk = chunks.get(&CPos(v.0, v.2));
                 if let Some(chunk) = chunk {
-                    if let Some(sec) = chunk.sections[v.1 as usize].as_ref() {
+                    if let Some(sec) = chunk.section(v.1) {
                         return Some((*v, sec.render_buffer.clone()));
                     }
                 }
@@ -723,15 +763,10 @@ impl World {
 
     // TODO: Improve the perf of this method as it is the MAIN bottleneck slowing down the program!
     fn get_render_section_mut(&self, x: i32, y: i32, z: i32) -> Option<(Option<CullInfo>, u32)> {
-        if !(0..=15).contains(&y) {
-            return None;
-        }
         if let Some(chunk) = self.chunks.read().get(&CPos(x, z)) {
-            let rendered = &chunk.sections_rendered_on[y as usize];
-            if let Some(sec) = chunk.sections[y as usize].as_ref() {
-                return Some((Some(sec.cull_info), *rendered));
-            }
-            return Some((None, *rendered));
+            let index = chunk.section_index(y)?;
+            let rendered = chunk.sections_rendered_on[index];
+            return Some((chunk.section(y).map(|sec| sec.cull_info), rendered));
         }
         None
     }
@@ -752,7 +787,7 @@ impl World {
 
     fn set_dirty(&self, x: i32, y: i32, z: i32) {
         if let Some(chunk) = self.chunks.write().get_mut(&CPos(x, z)) {
-            if let Some(sec) = chunk.sections.get_mut(y as usize).and_then(|v| v.as_mut()) {
+            if let Some(sec) = chunk.section_mut(y) {
                 sec.dirty = true;
             }
         }
@@ -760,7 +795,7 @@ impl World {
 
     pub fn is_section_dirty(&self, pos: (i32, i32, i32)) -> bool {
         if let Some(chunk) = self.chunks.read().get(&CPos(pos.0, pos.2)) {
-            if let Some(sec) = chunk.sections[pos.1 as usize].as_ref() {
+            if let Some(sec) = chunk.section(pos.1) {
                 return sec.dirty && !sec.building;
             }
         }
@@ -769,7 +804,7 @@ impl World {
 
     pub fn set_building_flag(&self, pos: (i32, i32, i32)) {
         if let Some(chunk) = self.chunks.write().get_mut(&CPos(pos.0, pos.2)) {
-            if let Some(sec) = chunk.sections[pos.1 as usize].as_mut() {
+            if let Some(sec) = chunk.section_mut(pos.1) {
                 sec.building = true;
                 sec.dirty = false;
             }
@@ -778,7 +813,7 @@ impl World {
 
     pub fn reset_building_flag(&self, pos: (i32, i32, i32)) {
         if let Some(chunk) = self.chunks.write().get_mut(&CPos(pos.0, pos.2)) {
-            if let Some(section) = chunk.sections[pos.1 as usize].as_mut() {
+            if let Some(section) = chunk.section_mut(pos.1) {
                 section.building = false;
             }
         }
@@ -806,11 +841,9 @@ impl World {
                 return None;
             }
         };
-        let sec = &chunk.sections[cy as usize];
-        if sec.is_none() {
-            return None;
-        }
-        return Some(sec.as_ref().unwrap().capture_snapshot(chunk.biomes));
+        chunk
+            .section(cy)
+            .map(|sec| sec.capture_snapshot(chunk.biomes))
     }
 
     pub fn unload_chunk(&self, x: i32, z: i32, m: &mut ecs::Manager) {
@@ -833,6 +866,11 @@ impl World {
         data: &mut Cursor<Vec<u8>>,
         version: u8,
     ) -> Result<(), protocol::Error> {
+        if self.bounds != WorldBounds::LEGACY {
+            return Err(protocol::Error::Err(
+                "legacy chunk codec requires legacy world bounds".into(),
+            ));
+        }
         let additional_light_data = self.lighting_cache.clone().write().remove(&CPos(x, z));
         let has_add_light = additional_light_data.is_some();
         let cpos = CPos(x, z);
@@ -855,7 +893,7 @@ impl World {
                     fill_sky &= (mask & !((1 << i) | ((1 << i) - 1))) == 0;
                     fill_sky &= self.dimension.load().has_sky_light();
                     if !fill_sky || mask & (1 << i) != 0 {
-                        chunk.sections[i] = Some(ChunkSection::new(i as u8, fill_sky));
+                        chunk.sections[i] = Some(ChunkSection::new(i as i32, fill_sky));
                     }
                 }
                 if mask & (1 << i) == 0 {
@@ -1408,15 +1446,7 @@ impl World {
     }
 
     fn flag_section_dirty(&self, x: i32, y: i32, z: i32) {
-        if !(0..=15).contains(&y) {
-            return;
-        }
-        let cpos = CPos(x, z);
-        if let Some(chunk) = self.chunks.write().get_mut(&cpos) {
-            if let Some(sec) = chunk.sections[y as usize].as_mut() {
-                sec.dirty = true;
-            }
-        }
+        self.set_dirty(x, y, z);
     }
 
     pub fn set_dimension(&self, new_dimension: Dimension) {
@@ -1524,6 +1554,76 @@ mod tests {
                 version,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn signed_world_queries_dirty_flags_and_snapshot_neighbors() {
+        let (tx, _rx) = unbounded();
+        let world = Arc::new(World::with_bounds(
+            758,
+            tx,
+            WorldBounds::new(-64, 384).unwrap(),
+        ));
+        for y in [-64, -17, -16, -1, 0, 255, 256, 319] {
+            assert!(world.set_block_raw(Position::new(-1, y, -1), block::Stone {}));
+            assert_eq!(world.get_block(Position::new(-1, y, -1)), block::Stone {});
+            assert!(world.capture_snapshot(-1, y, -1).is_some());
+            let section = (-1, y.div_euclid(16), -1);
+            assert!(world.is_section_dirty(section));
+            world.set_building_flag(section);
+            assert!(!world.is_section_dirty(section));
+            world.reset_building_flag(section);
+            world.set_dirty(section.0, section.1, section.2);
+            assert!(world.is_section_dirty(section));
+        }
+        // Section -1's neighbor below is -2; above is 0. All three must
+        // survive the snapshot used by the existing mesher.
+        let group = ChunkSectionSnapshotGroup::new(world.clone(), -1, -1, -1, 2);
+        for y in [-1, 0, 15, 16] {
+            assert_eq!(group.get_block(15, y, 15), block::Stone {});
+        }
+        assert_eq!(world.capture_snapshot(-1, -64, -1).unwrap().y, -4);
+        assert_eq!(world.capture_snapshot(-1, 319, -1).unwrap().y, 19);
+        for y in [i32::MIN, -65, 320, i32::MAX] {
+            assert!(world.capture_snapshot(-1, y, -1).is_none());
+            assert!(!world.set_block_raw(Position::new(100, y, 100), block::Stone {}));
+        }
+        assert!(!world.is_chunk_loaded(6, 6));
+        for section_y in [i32::MIN, -5, 20, i32::MAX] {
+            assert!(!world.is_section_dirty((-1, section_y, -1)));
+            world.set_building_flag((-1, section_y, -1));
+            world.reset_building_flag((-1, section_y, -1));
+            world.set_dirty(-1, section_y, -1);
+            assert!(world.get_render_section_mut(-1, section_y, -1).is_none());
+        }
+        let dirty = world.get_dirty_chunk_sections();
+        assert!(dirty.contains(&(-1, -4, -1)));
+        assert!(dirty.contains(&(-1, 19, -1)));
+    }
+
+    #[test]
+    fn cloud_texture_projection_does_not_truncate_world_heightmap() {
+        let (tx, _rx) = unbounded();
+        let world = World::with_bounds(758, tx, WorldBounds::new(-64, 1024).unwrap());
+        world.set_block_raw(Position::new(0, 700, 0), block::Stone {});
+        world.set_block_raw(Position::new(1, -32, 0), block::Stone {});
+        let mut texture = vec![0; 512 * 512];
+        assert!(world.copy_cloud_heightmap(&mut texture));
+        assert_eq!(&texture[..2], &[255, 0]);
+        let chunks = world.chunks.read();
+        let snapshot = chunks.get(&CPos(0, 0)).unwrap().capture_snapshot();
+        assert_eq!(&snapshot.heightmap[..2], &[700, -32]);
+    }
+
+    #[test]
+    fn legacy_chunk_mask_cannot_be_loaded_into_negotiated_tall_world() {
+        let (tx, _rx) = unbounded();
+        let world = World::with_bounds(758, tx, WorldBounds::new(-64, 384).unwrap());
+        let mut data = Cursor::new(Vec::new());
+        assert!(world
+            .load_chunk(0, 0, true, false, false, 0, 0, &mut data, 19)
+            .is_err());
+        assert!(world.chunks.read().is_empty());
     }
 
     #[test]
