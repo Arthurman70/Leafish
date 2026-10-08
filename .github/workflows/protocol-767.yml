@@ -24,7 +24,7 @@ jobs:
       - name: Build isolated conformance probes
         run: cargo build --locked -p leafish_protocol --examples
       - name: Verify exact state catalog behavior using synthetic data
-        run: cargo test --locked -p leafish_blocks catalog::
+        run: cargo test --locked -p leafish_blocks 'catalog::'
 
   client:
     strategy:
