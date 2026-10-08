@@ -32,6 +32,7 @@ use cgmath::prelude::*;
 use image::{GenericImage, GenericImageView, RgbaImage};
 use log::error;
 use std::collections::HashMap;
+use std::convert::TryFrom;
 use std::io::Write;
 use std::sync::Arc;
 
@@ -195,7 +196,8 @@ impl Renderer {
             1,
             gl::RGBA,
             gl::UNSIGNED_BYTE,
-            &[0; ATLAS_SIZE * ATLAS_SIZE * 4],
+            // Keep the 16 MiB initial atlas allocation explicitly on the heap.
+            &vec![0; ATLAS_SIZE * ATLAS_SIZE * 4],
         );
         tex.set_parameter(gl::TEXTURE_2D_ARRAY, gl::TEXTURE_MAG_FILTER, gl::NEAREST);
         tex.set_parameter(gl::TEXTURE_2D_ARRAY, gl::TEXTURE_MIN_FILTER, gl::NEAREST);
@@ -770,36 +772,49 @@ impl Renderer {
         info.count = count;
     }
 
-    #[allow(clippy::uninit_vec)]
     fn do_pending_textures(&self) {
         let len = {
             let tex = self.textures.read();
             // Rebuild the texture if it needs resizing
-            if self.texture_data.lock().texture_layers != tex.atlases.len() {
-                let len = ATLAS_SIZE * ATLAS_SIZE * 4 * tex.atlases.len();
-                let mut data = Vec::with_capacity(len);
-                // We are creating uninitialized values here, but as the renderer should be replaced with wgpu-mc soon-ish this isn't worth fixing.
-                unsafe {
-                    data.set_len(len);
-                }
-                self.texture_data.lock().gl_texture.get_pixels(
+            let mut texture_data = self.texture_data.lock();
+            if texture_data.texture_layers != tex.atlases.len() {
+                let bytes_per_layer = ATLAS_SIZE * ATLAS_SIZE * 4;
+                let old_len = bytes_per_layer
+                    .checked_mul(texture_data.texture_layers)
+                    .expect("Existing texture atlas exceeds addressable memory");
+                let new_len = bytes_per_layer
+                    .checked_mul(tex.atlases.len())
+                    .expect("Resized texture atlas exceeds addressable memory");
+                let new_depth = i32::try_from(tex.atlases.len())
+                    .expect("Texture atlas layer count exceeds OpenGL limits");
+                assert!(new_depth > 0, "Texture atlas must retain its default layer");
+
+                // GL reads the existing level's full size, even when the new
+                // atlas is smaller. RGBA/UNSIGNED_BYTE uses four bytes per
+                // pixel and our 2048-pixel rows meet default pack alignment.
+                let mut data = vec![0; old_len];
+                texture_data.gl_texture.bind(gl::TEXTURE_2D_ARRAY);
+                texture_data.gl_texture.get_pixels(
                     gl::TEXTURE_2D_ARRAY,
                     0,
                     gl::RGBA,
                     gl::UNSIGNED_BYTE,
-                    &mut data[..],
+                    &mut data,
                 );
-                self.texture_data.lock().gl_texture.image_3d(
+                // Preserve retained layers and initialize every new layer
+                // before it is uploaded. This also safely handles shrinking.
+                data.resize(new_len, 0);
+                texture_data.gl_texture.image_3d(
                     gl::TEXTURE_2D_ARRAY,
                     0,
                     ATLAS_SIZE as u32,
                     ATLAS_SIZE as u32,
-                    tex.atlases.len() as u32,
+                    new_depth as u32,
                     gl::RGBA,
                     gl::UNSIGNED_BYTE,
-                    &data[..],
+                    &data,
                 );
-                self.texture_data.lock().texture_layers = tex.atlases.len();
+                texture_data.texture_layers = tex.atlases.len();
             }
             tex.pending_uploads.len()
         };

@@ -18,7 +18,8 @@ support. This fork is not a dedicated-server implementation.
 | Native runtime adapter | Synthetic TCP tests cover configuration, movement, relative teleport generations, authoritative block changes, action acknowledgments, abilities, FIFO completion and consumer closure | Loopback vanilla reference only; authentication, mods, respawn and reconfiguration remain unsupported. Movement/action encoding is not gameplay parity |
 | Actual client adapter-to-store run | The client binary's native check retained 45 chunks / 1,080 sections and matched 4,423,680 block values plus 69,120 biome values to the independently decoded saved world | One movement echo and abilities were observed; this run contained no block updates, separate light updates or block entities. Those paths have synthetic tests, not live parity evidence |
 | Local assets and model definitions | Read-only client/resource ZIP mounting, version-correct object-index paths; model tests cover property subsets, exact alternatives, AND/OR, namespaces, parent replacement and texture aliases | Custom model loaders fail explicitly; empty geometry is reported separately, not treated as a successfully rendered entity |
-| Build and public tests | 55 protocol tests and 50 client tests passed locally; private configuration/model tests are ignored by default | Compilation and tests do not establish 1.21.1 GUI behavior; the separate legacy mining failure remains below |
+| Modern menu widgets | Buttons and sliders use the installed split sprites and their stretch, tile or nine-slice metadata; five synthetic tests and an optional check of all seven installed sprite states pass | Startup rendering is verified separately; this does not establish world rendering or gameplay |
+| Build and public tests | 55 protocol tests and 55 client tests passed locally; private configuration/model/widget tests are ignored by default | Compilation and tests do not establish 1.21.1 gameplay; the separate legacy mining failure remains below |
 
 The live run received no block entities. Its light-array count demonstrates
 decoding and retention, not an independent check of lighting values or rendered
@@ -84,6 +85,37 @@ ignored. That optional private configuration test also passed when explicitly
 run locally; it is not included in the public count. The separate legacy
 block-test failure is documented below; the complete client's test suite is
 not reported as passing.
+
+## Menu rendering verification
+
+Minecraft 1.21.1 replaces the old `gui/widgets` texture sheet with separate GUI
+sprites. The client now uses those sprites, including their scaling metadata,
+when available, and retains the old atlas path for older resource packs. The
+texture atlas resize path also reads the old allocation before resizing it and
+initializes added layers, avoiding an undersized readback buffer on shrink.
+
+For an isolated startup check, use your own client archive and asset index:
+
+```text
+leafish --profile-dir /path/to/separate-profile --client-jar /path/to/client-1.21.1.jar --assets-dir /path/to/assets --asset-index 17 --capture-frame /path/to/new-startup.png
+```
+
+This explicit diagnostic exports the fourth rendered startup frame from the
+client's own framebuffer and exits. The PNG path must not already exist; the
+readback is limited to 64 MiB. It does not capture other applications. Keep the
+image private because it contains installed artwork and may show account names
+if an existing profile is used. A fresh test profile avoids that issue.
+
+For the optional installed-widget reference test, set
+`LEAFISH_GUI_REFERENCE_ARCHIVE` to your own 1.21.1 client archive, then run:
+
+```text
+cargo test --locked -p leafish --bin leafish ui::sprites::tests::installed_widget_art_and_metadata_cover_each_state -- --ignored
+```
+
+These checks establish menu artwork and startup rendering only. The startup
+background is an image; it is not a rendered 1.21.1 world. Modern gameplay and
+the user's modpack remain unsupported.
 
 ## Native client world verification
 

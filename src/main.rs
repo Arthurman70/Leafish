@@ -19,6 +19,7 @@
 
 mod console;
 mod native_probe;
+mod render_check;
 use arc_swap::ArcSwapOption;
 use atomic_float::AtomicF64;
 use copypasta::nop_clipboard;
@@ -317,6 +318,10 @@ struct Opt {
     /// Exact blocks.json from the local 1.21.1 server data generator
     #[structopt(long, parse(from_os_str), requires = "verify-native-world")]
     block_catalog: Option<std::path::PathBuf>,
+
+    /// Save the fourth rendered startup frame to a new PNG, then exit (development check)
+    #[structopt(long, parse(from_os_str))]
+    capture_frame: Option<std::path::PathBuf>,
 }
 
 // TODO: Hide own character and show only the right hand. (with an item)
@@ -375,6 +380,7 @@ fn main() {
         }
     }
     let resource_manager = Arc::new(RwLock::new(res));
+    info!("Local resources mounted; creating window and graphics context");
 
     let events_loop = winit::event_loop::EventLoop::new().unwrap();
 
@@ -406,6 +412,7 @@ fn main() {
                 configs.next().unwrap()
             })
             .unwrap();
+        info!("Window and graphics configuration created");
 
         let raw_window_handle = window.as_ref().map(|window| window.raw_window_handle());
         let gl_display = gl_config.display();
@@ -424,6 +431,7 @@ fn main() {
                         .expect("failed to create context")
                 })
         };
+        info!("Graphics context created");
 
         let shader_version = match not_current_gl_context.context_api() {
             ContextApi::OpenGl(_) => "#version 150",  // OpenGL 3.2
@@ -439,9 +447,11 @@ fn main() {
                 .create_window_surface(&gl_config, &attrs)
                 .unwrap()
         };
+        info!("Graphics surface created");
 
         // Make it current.
         let gl_context = not_current_gl_context.make_current(&gl_surface).unwrap();
+        info!("Graphics context made current");
 
         if vsync {
             // Try setting vsync.
@@ -451,6 +461,7 @@ fn main() {
                 eprintln!("Error setting vsync: {res:?}");
             }
         }
+        info!("Swap interval configured; loading graphics functions");
 
         (gl_context, shader_version, window, gl_surface, gl_display)
     };
@@ -459,6 +470,7 @@ fn main() {
     info!("Shader version: {}", shader_version);
 
     let renderer = render::Renderer::new(resource_manager.clone(), shader_version);
+    info!("Renderer initialized");
     let ui_container = ui::Container::new();
 
     let mut last_frame = Instant::now();
@@ -545,6 +557,7 @@ fn main() {
         settings,
         keybinds,
     };
+    info!("Client initialized; entering window event loop");
     if opt.network_debug {
         protocol::enable_network_debug();
     }
@@ -565,6 +578,8 @@ fn main() {
 
     let game = Rc::clone(&game);
     let ui_container = Rc::clone(&ui_container);
+    let mut capture_frame = opt.capture_frame;
+    let mut rendered_frames = 0usize;
     events_loop
         .run(move |event, event_loop| {
             let game = game.borrow();
@@ -600,6 +615,20 @@ fn main() {
                 &mut last_resource_version,
                 vsync,
             );
+            rendered_frames = rendered_frames.saturating_add(1);
+            if rendered_frames == 1 {
+                info!("First frame rendered");
+            }
+            if rendered_frames >= 4 && capture_frame.is_some() {
+                let path = capture_frame.take().unwrap();
+                let size = window.inner_size();
+                if let Err(error) = render_check::capture(&path, size.width, size.height) {
+                    eprintln!("Render check failed: {}", error);
+                    std::process::exit(1);
+                }
+                info!("Startup frame captured");
+                game.set_should_close();
+            }
             if DEBUG {
                 let dist = Instant::now().checked_duration_since(start);
                 debug!("Ticking took {}", dist.unwrap().as_millis());

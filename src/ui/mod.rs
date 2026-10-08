@@ -13,6 +13,7 @@
 // limitations under the License.
 
 pub mod logo;
+mod sprites;
 
 use crate::format;
 use crate::render;
@@ -1304,12 +1305,14 @@ element! {
         pub height: f64,
         pub hovered: bool,
         priv last_hovered: bool,
+        priv slider_handle: bool,
         priv last_disabled: bool,
         priv texts: Vec<TextRef>,
     }
     builder ButtonBuilder {
         hardcode hovered = false,
         hardcode last_hovered = false,
+        hardcode slider_handle = false,
         hardcode last_disabled = false,
         hardcode texts = vec![],
         optional disabled: bool = false,
@@ -1339,145 +1342,158 @@ impl UIElement for Button {
     ) -> &mut [u8] {
         if self.check_rebuild() {
             self.data.clear();
-            let offset = match (self.disabled, self.hovered) {
-                (true, _) => 46.0,
-                (false, true) => 86.0,
-                (false, false) => 66.0,
+            let widget = if self.slider_handle {
+                sprites::Widget::SliderHandle {
+                    highlighted: self.hovered && !self.disabled,
+                }
+            } else {
+                sprites::Widget::Button {
+                    disabled: self.disabled,
+                    highlighted: self.hovered,
+                }
             };
-            let texture = render::Renderer::get_texture(renderer.get_textures_ref(), "gui/widgets")
-                .relative(0.0, offset / 256.0, 200.0 / 256.0, 20.0 / 256.0);
+            if !sprites::draw(&renderer, widget, r, sw, sh, width, height, &mut self.data) {
+                let offset = match (self.disabled, self.hovered) {
+                    (true, _) => 46.0,
+                    (false, true) => 86.0,
+                    (false, false) => 66.0,
+                };
+                let texture =
+                    render::Renderer::get_texture(renderer.get_textures_ref(), "gui/widgets")
+                        .relative(0.0, offset / 256.0, 200.0 / 256.0, 20.0 / 256.0);
 
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x,
-                    r.y,
-                    4.0 * sw,
-                    4.0 * sh,
-                    0.0,
-                    0.0,
-                    2.0 / 200.0,
-                    2.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x + r.w - 4.0 * sw,
-                    r.y,
-                    4.0 * sw,
-                    4.0 * sh,
-                    198.0 / 200.0,
-                    0.0,
-                    2.0 / 200.0,
-                    2.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x,
-                    r.y + r.h - 6.0 * sh,
-                    4.0 * sw,
-                    6.0 * sh,
-                    0.0,
-                    17.0 / 20.0,
-                    2.0 / 200.0,
-                    3.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x + r.w - 4.0 * sw,
-                    r.y + r.h - 6.0 * sh,
-                    4.0 * sw,
-                    6.0 * sh,
-                    198.0 / 200.0,
-                    17.0 / 20.0,
-                    2.0 / 200.0,
-                    3.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x,
+                        r.y,
+                        4.0 * sw,
+                        4.0 * sh,
+                        0.0,
+                        0.0,
+                        2.0 / 200.0,
+                        2.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x + r.w - 4.0 * sw,
+                        r.y,
+                        4.0 * sw,
+                        4.0 * sh,
+                        198.0 / 200.0,
+                        0.0,
+                        2.0 / 200.0,
+                        2.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x,
+                        r.y + r.h - 6.0 * sh,
+                        4.0 * sw,
+                        6.0 * sh,
+                        0.0,
+                        17.0 / 20.0,
+                        2.0 / 200.0,
+                        3.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x + r.w - 4.0 * sw,
+                        r.y + r.h - 6.0 * sh,
+                        4.0 * sw,
+                        6.0 * sh,
+                        198.0 / 200.0,
+                        17.0 / 20.0,
+                        2.0 / 200.0,
+                        3.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            let w = ((r.w / sw) / 2.0) - 4.0;
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 0.0, 196.0 / 200.0, 2.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y,
-                    r.w - 8.0 * sw,
-                    4.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    1.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 17.0 / 20.0, 196.0 / 200.0, 3.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y + r.h - 6.0 * sh,
-                    r.w - 8.0 * sw,
-                    6.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    1.0,
-                )
-                .bytes(width, height),
-            );
+                let w = ((r.w / sw) / 2.0) - 4.0;
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 0.0, 196.0 / 200.0, 2.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y,
+                        r.w - 8.0 * sw,
+                        4.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        1.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 17.0 / 20.0, 196.0 / 200.0, 3.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y + r.h - 6.0 * sh,
+                        r.w - 8.0 * sw,
+                        6.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        1.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            let h = ((r.h / sh) / 2.0) - 5.0;
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(0.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
-                    r.x,
-                    r.y + 4.0 * sh,
-                    4.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    1.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(198.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
-                    r.x + r.w - 4.0 * sw,
-                    r.y + 4.0 * sh,
-                    4.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    1.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
+                let h = ((r.h / sh) / 2.0) - 5.0;
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(0.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
+                        r.x,
+                        r.y + 4.0 * sh,
+                        4.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        1.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(198.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
+                        r.x + r.w - 4.0 * sw,
+                        r.y + 4.0 * sh,
+                        4.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        1.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 2.0 / 20.0, 196.0 / 200.0, 15.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y + 4.0 * sh,
-                    r.w - 8.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 2.0 / 20.0, 196.0 / 200.0, 15.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y + 4.0 * sh,
+                        r.w - 8.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
+            }
             self.super_draw(renderer, r, sw, sh, width, height, delta);
             self.last_disabled = self.disabled;
             self.last_hovered = self.hovered;
@@ -1669,9 +1685,13 @@ element! {
         pub button: Option<ButtonRef>,
         pub text: Option<TextRef>,
         priv last_disabled: bool,
+        priv hovered: bool,
+        priv last_hovered: bool,
     }
     builder SliderBuilder {
         hardcode last_disabled = false,
+        hardcode hovered = false,
+        hardcode last_hovered = false,
         hardcode button = None,
         hardcode text = None,
         optional disabled: bool = false,
@@ -1702,143 +1722,150 @@ impl UIElement for Slider {
         if self.check_rebuild() {
             self.data.clear();
 
-            let texture = render::Renderer::get_texture(renderer.get_textures_ref(), "gui/widgets")
-                .relative(0.0, 46.0 / 256.0, 200.0 / 256.0, 20.0 / 256.0);
+            let widget = sprites::Widget::Slider {
+                highlighted: self.hovered && !self.disabled,
+            };
+            if !sprites::draw(&renderer, widget, r, sw, sh, width, height, &mut self.data) {
+                let texture =
+                    render::Renderer::get_texture(renderer.get_textures_ref(), "gui/widgets")
+                        .relative(0.0, 46.0 / 256.0, 200.0 / 256.0, 20.0 / 256.0);
 
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x,
-                    r.y,
-                    4.0 * sw,
-                    4.0 * sh,
-                    0.0,
-                    0.0,
-                    2.0 / 200.0,
-                    2.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x,
+                        r.y,
+                        4.0 * sw,
+                        4.0 * sh,
+                        0.0,
+                        0.0,
+                        2.0 / 200.0,
+                        2.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x + r.w - 4.0 * sw,
-                    r.y,
-                    4.0 * sw,
-                    4.0 * sh,
-                    198.0 / 200.0,
-                    0.0,
-                    2.0 / 200.0,
-                    2.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x,
-                    r.y + r.h - 6.0 * sh,
-                    4.0 * sw,
-                    6.0 * sh,
-                    0.0,
-                    17.0 / 20.0,
-                    2.0 / 200.0,
-                    3.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture,
-                    r.x + r.w - 4.0 * sw,
-                    r.y + r.h - 6.0 * sh,
-                    4.0 * sw,
-                    6.0 * sh,
-                    198.0 / 200.0,
-                    17.0 / 20.0,
-                    2.0 / 200.0,
-                    3.0 / 20.0,
-                )
-                .bytes(width, height),
-            );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x + r.w - 4.0 * sw,
+                        r.y,
+                        4.0 * sw,
+                        4.0 * sh,
+                        198.0 / 200.0,
+                        0.0,
+                        2.0 / 200.0,
+                        2.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x,
+                        r.y + r.h - 6.0 * sh,
+                        4.0 * sw,
+                        6.0 * sh,
+                        0.0,
+                        17.0 / 20.0,
+                        2.0 / 200.0,
+                        3.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture,
+                        r.x + r.w - 4.0 * sw,
+                        r.y + r.h - 6.0 * sh,
+                        4.0 * sw,
+                        6.0 * sh,
+                        198.0 / 200.0,
+                        17.0 / 20.0,
+                        2.0 / 200.0,
+                        3.0 / 20.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            let w = ((r.w / sw) / 2.0) - 4.0;
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 0.0, 196.0 / 200.0, 2.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y,
-                    r.w - 8.0 * sw,
-                    4.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    1.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 17.0 / 20.0, 196.0 / 200.0, 3.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y + r.h - 6.0 * sh,
-                    r.w - 8.0 * sw,
-                    6.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    1.0,
-                )
-                .bytes(width, height),
-            );
+                let w = ((r.w / sw) / 2.0) - 4.0;
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 0.0, 196.0 / 200.0, 2.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y,
+                        r.w - 8.0 * sw,
+                        4.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        1.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 17.0 / 20.0, 196.0 / 200.0, 3.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y + r.h - 6.0 * sh,
+                        r.w - 8.0 * sw,
+                        6.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        1.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            let h = ((r.h / sh) / 2.0) - 5.0;
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(0.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
-                    r.x,
-                    r.y + 4.0 * sh,
-                    4.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    1.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(198.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
-                    r.x + r.w - 4.0 * sw,
-                    r.y + 4.0 * sh,
-                    4.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    1.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
+                let h = ((r.h / sh) / 2.0) - 5.0;
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(0.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
+                        r.x,
+                        r.y + 4.0 * sh,
+                        4.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        1.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(198.0 / 200.0, 2.0 / 20.0, 2.0 / 200.0, 15.0 / 20.0),
+                        r.x + r.w - 4.0 * sw,
+                        r.y + 4.0 * sh,
+                        4.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        1.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
 
-            self.data.extend(
-                render::ui::UIElement::new(
-                    &texture.relative(2.0 / 200.0, 2.0 / 20.0, 196.0 / 200.0, 15.0 / 20.0),
-                    r.x + 4.0 * sw,
-                    r.y + 4.0 * sh,
-                    r.w - 8.0 * sw,
-                    r.h - 10.0 * sh,
-                    0.0,
-                    0.0,
-                    w / 196.0,
-                    h / 16.0,
-                )
-                .bytes(width, height),
-            );
+                self.data.extend(
+                    render::ui::UIElement::new(
+                        &texture.relative(2.0 / 200.0, 2.0 / 20.0, 196.0 / 200.0, 15.0 / 20.0),
+                        r.x + 4.0 * sw,
+                        r.y + 4.0 * sh,
+                        r.w - 8.0 * sw,
+                        r.h - 10.0 * sh,
+                        0.0,
+                        0.0,
+                        w / 196.0,
+                        h / 16.0,
+                    )
+                    .bytes(width, height),
+                );
+            }
             self.super_draw(renderer, r, sw, sh, width, height, delta);
             self.last_disabled = self.disabled;
+            self.last_hovered = self.hovered;
         }
         &mut self.data
     }
@@ -1848,7 +1875,7 @@ impl UIElement for Slider {
     }
 
     fn is_dirty(&self) -> bool {
-        self.last_disabled != self.disabled
+        self.last_disabled != self.disabled || self.last_hovered != self.hovered
     }
 
     fn post_init(s: Rc<RefCell<Self>>) {
@@ -1861,6 +1888,8 @@ impl UIElement for Slider {
                 .attach(&mut *slider),
         );
 
+        slider.button.as_ref().unwrap().borrow_mut().slider_handle = true;
+
         // the slider needs to handle the button hover status
         slider
             .button
@@ -1870,12 +1899,16 @@ impl UIElement for Slider {
             .hover_funcs
             .pop();
         slider.add_hover_func(|this, hover, _| {
+            this.hovered = hover;
             this.button.as_mut().unwrap().borrow_mut().hovered = hover;
             true
         });
     }
 
     fn tick(&mut self, renderer: Arc<render::Renderer>) {
+        if let Some(button) = &self.button {
+            button.borrow_mut().disabled = self.disabled;
+        }
         self.super_tick(renderer);
     }
 }

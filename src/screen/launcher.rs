@@ -33,6 +33,7 @@ use std::rc::Rc;
 
 pub struct Launcher {
     rendered_accounts: Vec<RenderAccount>,
+    labels: Vec<ui::TextRef>,
     options: Option<ui::ButtonRef>,
     disclaimer: Option<ui::TextRef>,
     accounts: Arc<Mutex<Vec<Account>>>,
@@ -67,6 +68,7 @@ impl Launcher {
     ) -> Self {
         Launcher {
             rendered_accounts: vec![],
+            labels: vec![],
             options: None,
             disclaimer: None,
             accounts,
@@ -86,6 +88,46 @@ impl super::Screen for Launcher {
         _renderer: Arc<Renderer>,
         ui_container: &mut ui::Container,
     ) {
+        let has_accounts = !self.accounts.lock().is_empty();
+        self.labels.push(
+            ui::TextBuilder::new()
+                .text("Leafish")
+                .position(0.0, 45.0)
+                .scale_x(2.0)
+                .scale_y(2.0)
+                .draw_index(1)
+                .alignment(ui::VAttach::Top, ui::HAttach::Center)
+                .create(ui_container),
+        );
+        self.labels.push(
+            ui::TextBuilder::new()
+                .text("Select an account")
+                .position(0.0, 105.0)
+                .draw_index(1)
+                .alignment(ui::VAttach::Top, ui::HAttach::Center)
+                .create(ui_container),
+        );
+        self.labels.push(
+            ui::TextBuilder::new()
+                .text("Minecraft 1.21.1 gameplay is not available yet")
+                .position(0.0, 135.0)
+                .colour((255, 220, 160, 255))
+                .draw_index(1)
+                .alignment(ui::VAttach::Top, ui::HAttach::Center)
+                .create(ui_container),
+        );
+        if !has_accounts {
+            self.labels.push(
+                ui::TextBuilder::new()
+                    .text("No accounts added to this profile.")
+                    .position(0.0, -25.0)
+                    .colour((210, 210, 210, 255))
+                    .draw_index(1)
+                    .alignment(ui::VAttach::Middle, ui::HAttach::Center)
+                    .create(ui_container),
+            );
+        }
+
         // Options menu
         let options = ui::ButtonBuilder::new()
             .position(5.0, 25.0)
@@ -123,17 +165,22 @@ impl super::Screen for Launcher {
             .create(ui_container);
         self.disclaimer.replace(disclaimer);
 
-        // Add a new server to the list
+        // Keep the action above populated account rows, or centered in an empty list.
+        let (add_x, add_y) = if has_accounts {
+            (180.0, -65.0)
+        } else {
+            (0.0, 20.0)
+        };
         let add = ui::ButtonBuilder::new()
-            .position(200.0, -50.0 - 15.0)
-            .size(100.0, 30.0)
+            .position(add_x, add_y)
+            .size(140.0, 30.0)
             .alignment(ui::VAttach::Middle, ui::HAttach::Center)
             .draw_index(2)
             .create(ui_container);
         {
             let mut add = add.borrow_mut();
             let txt = ui::TextBuilder::new()
-                .text("Add")
+                .text("Add account")
                 .alignment(ui::VAttach::Middle, ui::HAttach::Center)
                 .attach(&mut *add);
             add.add_text(txt);
@@ -427,6 +474,7 @@ impl super::Screen for Launcher {
         // Clean up
         self.options.take();
         self.disclaimer.take();
+        self.labels.clear();
         self.rendered_accounts.clear();
         self.add.take();
         self.background_selection.take();

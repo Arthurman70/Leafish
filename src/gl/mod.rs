@@ -37,6 +37,40 @@ fn glow_context() -> &'static glow::Context {
     unsafe { CONTEXT.as_ref().unwrap() }
 }
 
+/// Read the completed window back buffer for an explicit render diagnostic.
+/// Call on the context's thread after rendering and before swapping buffers.
+pub fn read_window_rgba(width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let len = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .filter(|&bytes| bytes > 0 && bytes <= 64 * 1024 * 1024)
+        .ok_or("Render capture exceeds the 64 MiB limit")?;
+    if width > i32::MAX as u32 || height > i32::MAX as u32 {
+        return Err("Render capture dimensions exceed GL limits".into());
+    }
+    let mut rgba = vec![0u8; len];
+    unsafe {
+        let context = glow_context();
+        context.bind_framebuffer(gl::READ_FRAMEBUFFER, None);
+        context.read_buffer(gl::BACK);
+        context.pixel_store_i32(gl::PACK_ALIGNMENT, 4);
+        context.read_pixels(
+            0,
+            0,
+            width as i32,
+            height as i32,
+            gl::RGBA,
+            gl::UNSIGNED_BYTE,
+            gl::PixelPackData::Slice(&mut rgba),
+        );
+        let error = context.get_error();
+        if error != gl::NO_ERROR {
+            return Err(format!("GL frame readback failed: 0x{:x}", error));
+        }
+    }
+    Ok(rgba)
+}
+
 /// Dsed to specify how the vertices will be handled
 /// to draw.
 pub type DrawType = u32;
