@@ -7,9 +7,10 @@ support. This fork is not a dedicated-server implementation.
 
 The explicit `--local-world` path now supports an early, local Creative session
 against a separate **official vanilla Java 1.21.1 server**. It renders real
-received terrain using supplied 1.21.1 models/textures, moves and collides,
-and sends Creative block selection, breaking and placement to the server. It
-skips account loading and the login screen. This is not complete Minecraft,
+received terrain using supplied 1.21.1 models/textures, supports ordinary dry
+walking, sprinting, jumping, stepping and Creative flight, and sends Creative
+block selection, breaking and placement to the server. It skips account loading
+and the login screen. This is not complete Minecraft,
 survival, NeoForge/Create compatibility, or a Rust server, and no performance
 gain has been established.
 
@@ -23,28 +24,58 @@ server. For this milestone use peaceful daytime and disable mob spawning;
 entity rendering, weather, survival and dimension changes are unfinished.
 
 Generate exact block/item reports with `tools/generate_vanilla_reference.py`
-and the collision/outline report using
+and the schema-two collision/outline/movement report using
 [the source-only shape exporter](tools/SHAPE_REFERENCE.md). Generated reports,
 assets and game archives are local inputs, not distributed with this fork.
 
 ```text
-leafish --local-world 127.0.0.1:25587 --profile-dir /path/to/new-profile --client-jar /path/to/client-1.21.1.jar --assets-dir /path/to/assets --asset-index 17 --block-catalog /path/to/blocks.json --item-registry /path/to/registries.json --shape-catalog /path/to/shapes-v1.json
+leafish --local-world 127.0.0.1:25587 --profile-dir /path/to/new-profile --client-jar /path/to/client-1.21.1.jar --assets-dir /path/to/assets --asset-index 17 --block-catalog /path/to/blocks.json --item-registry /path/to/registries.json --shape-catalog /path/to/shapes-v2.json
 ```
 
-Controls: WASD movement, mouse look, Space/Shift flight, Ctrl faster flight,
-left/right click break/place, 1–9 or wheel hotbar, E searchable block picker,
-arrows/Enter picker selection, Escape releases/resumes controls, F11 fullscreen.
+Controls: WASD movement, mouse look, Space jump, double-tap Space to toggle
+Creative flight, Space/Shift up/down while flying, and Ctrl sprint/faster flight.
+Double-tap W also starts ordinary walking sprint.
+Left/right click breaks/places blocks, with held-button repetition; 1–9 or the
+wheel selects a hotbar slot. E opens the searchable block picker, arrows/Enter
+select, Escape releases/resumes controls, and F11 toggles fullscreen.
 Closing the client disconnects it; your server launcher is responsible for a
-clean world save and shutdown. The block picker is an early text UI; item model
-icons and the complete inventory are not implemented.
+clean world save and shutdown. Saved hotbar contents and selection are retained
+when reconnecting; initial blocks are supplied only for a new empty hotbar.
+Picker requests use one item, which remains valid for signs and unstackable
+shulker boxes; Creative placement does not consume it. This avoids a silently
+rejected over-limit stack leaving later selections waiting for confirmation.
+The live picker check confirmed signs, shulker boxes and then planks in sequence
+through the server before placing the final block.
+
+The hotbar renders supported block-item icons from their installed item models,
+textures and inherited GUI transforms. Unsupported item/entity renderers keep
+text labels. The picker remains a text list; the complete inventory, arbitrary
+item components and full item-rendering parity are unfinished.
+Front-facing generated sprites are supported; rotated generated sprites,
+conditional overrides, custom color handlers and entity models remain text.
+Animated textures use their first declared frame. Four focused icon tests and
+a private installed-artwork check covering 12 block items passed; the entity
+model for a chest was deliberately rejected rather than replaced with a cube.
 
 The graphical checks used the actual Windows client executable and a separate
-vanilla server. A normal-terrain run received 45 chunks and rendered 390 section
-meshes. A separate controlled run moved horizontally/upward, broke a block and
-placed oak planks through server-authoritative updates and acknowledgments.
+vanilla server. A normal-terrain run received 45 chunks and rendered terrain
+section meshes. A separate controlled run moved horizontally/upward, broke a
+block and placed oak planks through server-authoritative updates and acknowledgments.
 Independent decoding of the stopped server's save confirmed the final block,
 player position, Creative flight and selected slot. These bounded checks do not
-establish full gameplay parity.
+establish full gameplay parity. The updated action check and a subsequent
+reconnection also retained the selected oak-plank hotbar slot and saved position.
+
+A new controlled motion run walked over six blocks, stepped onto a half slab,
+jumped and landed, then enabled flight through the double-tap gesture. The
+reported step height was 0.5 blocks and jump height was 1.252203340253729 blocks.
+A separate Java reference invoked the original runtime's input-vector,
+ground-acceleration and attribute methods, then evaluated the mapped ordinary
+dry-motion equations; its jump apex was 1.2522033402537238. Independently reading
+the stopped save confirmed the slab identity, final player position, zero final
+motion, Creative flight and selected slot. Intermediate stepping and jumping
+are client per-tick observations compared with that reference: the final save
+cannot independently prove the intermediate trajectory.
 
 `--capture-frame /path/to/new.png` exports the client's own rendered world after
 initial meshing, then exits. Adding `--verify-local-play` enables a bounded
@@ -53,13 +84,34 @@ use it on a world you care about. Its JSON report distinguishes unsupported
 visual states and does not claim complete parity. Keep captures and reports
 private because they include installed artwork and world content.
 
-Current boundaries: static shapes are exported from the official runtime and
-bound to the exact state catalog. Dynamic, offset or context-dependent shapes
-remain unresolved and stop affected collision/targeting explicitly. Survival
-physics, stepping, fluid motion, entities/block-entity visuals, complete item
-components/inventories/crafting, sound, dimension changes, remote authentication,
-NeoForge and mods remain unfinished. Fluids and biome tinting have a native
-rendering path, but partial/waterlogged boundaries, blending, ambient occlusion
+`--verify-local-motion` is a separate controlled-fixture diagnostic for walking,
+half-slab stepping, jumping/landing and flight toggling. It requires a prepared
+disposable flat-world fixture and `--capture-frame`; it is not a general-world
+self-test and cannot be combined with `--verify-local-play`.
+For that fixture, use a grass-block floor at `x=3..10, y=-61, z=-4..16`, clear
+the air at `x=3..10, y=-60..-56, z=-4..16`, and place non-waterlogged bottom
+stone slabs at `x=3..10, y=-60, z=4`. As `ReformedLocal` joins, issue
+`tp ReformedLocal 6.5 -60 0.5 0 0` from the isolated server console before the
+diagnostic's initial five-second wait ends. Start with these changes prepared
+only in the disposable flat world; the client then walks forward along that path.
+
+Current boundaries: schema-two shapes are exported from the official runtime and
+bound to the exact state catalog. They include verified positional plant offsets,
+block movement factors, and empty water/lava collision for the ordinary player
+context. Remaining dynamic or context-dependent shapes stop affected collision
+or targeting explicitly. Schema-one reports remain readable, but cannot supply
+the offsets or movement factors required by the updated movement path.
+
+Dry movement uses a standing body and the ordinary, unmodified player attributes.
+Support-block selection currently samples beneath the foot center instead of
+reproducing the full supporting-block selection at edges. Swimming, crouching,
+edge-sneaking, movement effects/equipment attributes, special block callbacks,
+entity/world-border collision and complete survival physics are unfinished.
+Walking into a water/lava cell reports that swimming is unsupported; empty fluid
+collision does not implement fluid travel. Entities/block-entity visuals,
+complete item components/inventories/crafting, sound, dimension changes, remote
+authentication, NeoForge and mods also remain unfinished. Fluids and biome
+tinting have a native rendering path, but partial/waterlogged boundaries, blending, ambient occlusion
 and some biome color modifiers are incomplete. The normal legacy server-browser
 path still excludes protocol 767; use this explicit local Creative path only.
 
@@ -71,15 +123,23 @@ path still excludes protocol 767; use this explicit local Creative path only.
 | Modern section decoding | Source-based unit tests and six synthetic sections serialized by Minecraft 1.21.1's `PalettedContainer.write`; all 24,576 block IDs and 384 biome IDs compared against independent expected values | Establishes section decoding independently of the live test; does not establish rendering |
 | Bounded Play session without a renderer | An isolated vanilla 1.21.1 run decoded 45 chunks, 1,080 sections, 4,423,680 block-state values, and 91 light arrays; acknowledged 19 batches, one teleport, and two distinct keepalives in about 30 seconds | Many other Play packets are counted as unimplemented; no renderer or gameplay integration |
 | Independent saved-world comparison | All 4,423,680 block-state values and 69,120 biome values from those 45 chunks matched the independently decoded saved world after a clean server shutdown | Compares block and biome identities only; does not independently verify lighting or entity data |
-| Signed dimension heights | Validated immutable world bounds, dynamic sections, signed heightmaps, snapshot and dirty-region tests; the 20 legacy chunk fixtures still pass | CPU storage supports negative/tall dimensions; cloud texture remains a legacy 8-bit projection and full modern rendering/collision remains pending |
-| Exact runtime identities and world storage | Caller-supplied state catalog with checked forward/reverse lookup; native chunk store retains raw states, quart biomes, NBT and merged light, with atomic update validation and retention bounds | Separate from the legacy block enum; no unknown state becomes air. Material, collision, light emission and behavior metadata are still required |
+| Signed dimension heights | Validated immutable world bounds, dynamic sections, signed heightmaps, snapshot and dirty-region tests; the 20 legacy chunk fixtures still pass | Local native rendering/collision uses signed sections; the legacy cloud texture is still an 8-bit projection and is omitted from the native path |
+| Exact runtime identities and world storage | Caller-supplied state catalog with checked forward/reverse lookup; native chunk store retains raw states, quart biomes, NBT and merged light, with atomic update validation and retention bounds | Separate from the legacy block enum; no unknown state becomes air. Additional material, light-emission and dynamic behavior metadata remain necessary |
 | Native runtime adapter | Synthetic TCP tests cover configuration, movement, relative teleport generations, authoritative block changes, action acknowledgments, abilities, FIFO completion and consumer closure | Loopback vanilla reference only; authentication, mods, respawn and reconfiguration remain unsupported. Movement/action encoding is not gameplay parity |
 | Actual client adapter-to-store run | The client binary's native check retained 45 chunks / 1,080 sections and matched 4,423,680 block values plus 69,120 biome values to the independently decoded saved world | One movement echo and abilities were observed; this run contained no block updates, separate light updates or block entities. Those paths have synthetic tests, not live parity evidence |
 | Local assets and model definitions | Read-only client/resource ZIP mounting, version-correct object-index paths; model tests cover property subsets, exact alternatives, AND/OR, namespaces, parent replacement and texture aliases | Custom model loaders fail explicitly; empty geometry is reported separately, not treated as a successfully rendered entity |
 | Modern menu widgets | Buttons and sliders use the installed split sprites and their stretch, tile or nine-slice metadata; five synthetic tests and an optional check of all seven installed sprite states pass | Startup rendering is verified separately; this does not establish world rendering or gameplay |
-| Native Creative GUI | Modern store to terrain meshing, exact artwork, biome colors, fluids, modern hotbar and searchable block selection; live normal terrain and confirmed block edits | Early local Creative scope above; no full-game or mod parity |
-| Collision and targeting | Exact 26,684-state identity match; 26,473 collision shapes and 26,379 outline shapes resolved from the official runtime; ray and player collision tests | Unresolved contextual shapes are explicit errors; no substitute cubes or air |
-| Build and public tests | 58 protocol and 81 client tests passed; private reference tests are ignored by default | Compilation and unit tests do not establish complete gameplay; the separate legacy mining failure remains below |
+| Native Creative GUI | Modern store to terrain meshing, exact artwork, biome colors, fluids, modern hotbar and searchable block selection; live normal terrain, confirmed block edits and saved-session reopening | Early local Creative scope above; no full-game or mod parity |
+| Block-item hotbar icons | Installed item-model geometry, UVs, GUI transforms and supported flat layers rendered into a bounded icon cache; synthetic tests and a private installed-artwork check | Unsupported/custom/entity models retain text; picker and full inventory rendering remain unfinished |
+| Dry walking and Creative flight | Fixed 20 Hz input, jump/gravity/drag, sprinting, momentum handoff and double-tap flight; original-runtime numeric samples and the live motion/save check above | Ordinary standing player only; center-foot support approximation, no swimming/crouching/effects or complete survival physics |
+| Collision and targeting | Schema two matches all 26,684 state identities; 26,537 collision and 26,505 outline shapes resolved, with positional offsets, movement factors and candidate-height stepping | 147 collision and 179 outline states remain unresolved; no substitute cubes or air. Fluid collision is not fluid physics |
+| Build and public tests | 58 protocol and 103 client tests passed; private reference tests are ignored by default | Compilation and unit tests do not establish complete gameplay; the separate legacy mining failure remains below |
+
+The schema-two generator checks 126 offset-bearing states at 68 positions each
+against the original vanilla methods. A separate optional Rust comparison passed
+all 272 retained offset/collision/outline samples and all 32 water/lava collision
+states. See the [shape reference instructions](tools/SHAPE_REFERENCE.md) for
+reproduction and the exact remaining context limits.
 
 The live run received no block entities. Its light-array count demonstrates
 decoding and retention, not an independent check of lighting values or rendered
@@ -101,8 +161,8 @@ The packet and section layouts were checked against locally supplied Minecraft
 The isolated Play session and independent saved-world comparison have passed.
 The client includes the modern adapter and exact native world store. The normal
 server browser still uses its legacy path; the explicit local Creative path
-connects the modern store to rendering, static collision, basic inventory
-selection and block interaction. Complete behavior remains unfinished. A
+connects the modern store to rendering, bounded dry movement and collision,
+basic inventory selection and block interaction. Complete behavior remains unfinished. A
 rendered model alone does not define a block's rules.
 
 Further work includes applying negotiated registries and dimension properties
@@ -142,10 +202,10 @@ command builds Leafish; local 1.21.1 play needs the explicit inputs above. Legac
 client behavior and tests remain relevant during the port.
 
 The verified public protocol result is 58 passed and one private-fixture test
-ignored; the client result is 81 passed and two private tests ignored. That
+ignored; the client result is 103 passed and four private tests ignored. That
 optional private configuration test also passed when explicitly
 run locally; it is not included in the public count. The separate legacy
-block-test failure is documented below; the complete client's test suite is
+block-test failure is documented below; the complete workspace test suite is
 not reported as passing.
 
 ## Menu rendering verification

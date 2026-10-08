@@ -19,3 +19,4 @@ install/resources/bootstrap_*
 # Synthetic numeric chunk fixtures in chunks-767 remain versioned.
 /protocol/tests/fixtures/configuration-767/
 /tools/__pycache__/
+/logs/

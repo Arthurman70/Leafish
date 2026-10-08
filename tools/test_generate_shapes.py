@@ -1,5 +1,6 @@
 """Portable synthetic checks; no Minecraft files, Java, or network required."""
 from contextlib import contextmanager
+import copy
 import hashlib
 import io
 import json
@@ -35,6 +36,64 @@ def digest(data):
 
 
 class ShapeHelperTests(unittest.TestCase):
+    def state(self):
+        return dict(name="minecraft:water", dynamic=False, has_offset=False,
+                    movement=dict(friction=0.6, speed_factor=1.0, jump_factor=1.0), offset=None,
+                    collision_context="vanilla_player_no_fluid_standing", collision=[], outline=[],
+                    collision_offset=False, outline_offset=False, collision_unresolved=None, outline_unresolved=None)
+
+    def test_schema_two_fluid_context_cannot_be_used_for_other_blocks(self):
+        state = self.state()
+        helper.validate_state(state)
+        for changed in [dict(name="minecraft:stone"), dict(collision=[[0,0,0,1,1,1]]),
+                        dict(collision_offset=True), dict(collision_context="guessed empty")]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                helper.validate_state(state | changed)
+
+    def test_schema_two_preserves_unresolved_and_positioned_shapes(self):
+        state = self.state() | dict(name="minecraft:bamboo", dynamic=True, has_offset=True,
+                                  collision_context="independent", collision=[[0.4,0,0.4,0.6,1,0.6]], collision_offset=True,
+                                  offset=dict(kind="xz", max_horizontal=0.25, max_vertical=0.2))
+        helper.validate_state(state)
+        for changed in [dict(offset=None), dict(has_offset=False), dict(collision=None),
+                        dict(offset=dict(kind="guessed", max_horizontal=0.25, max_vertical=0.2))]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                helper.validate_state(state | changed)
+        dynamic = self.state() | dict(name="minecraft:moving_piston", dynamic=True, collision_context="independent",
+                                     collision=None, outline=None, collision_unresolved="dynamic shape", outline_unresolved="dynamic shape")
+        helper.validate_state(dynamic)
+        for changed in [dict(collision=[], collision_unresolved=None), dict(collision_unresolved="reference method failed: Unexpected")]:
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                helper.validate_state(dynamic | changed)
+
+    def test_movement_factors_and_boxes_are_finite_bounded_and_explicit(self):
+        for value in [float("nan"), float("inf"), -0.1, 17, True, "0.6"]:
+            state = self.state(); state["movement"]["friction"] = value
+            with self.subTest(value=value), self.assertRaises(ValueError): helper.validate_state(state)
+        for boxes in [[[0,0,0,0,1,1]], [[0,0,0,1,float("inf"),1]], [[0,0,0,1,1025,1]], [[0,0,0,1,1,1]]*257]:
+            with self.subTest(boxes=len(boxes)), self.assertRaises(ValueError): helper.validate_boxes(boxes)
+        helper.validate_boxes([[0.375,0,0.375,0.625,1.5,0.625]])  # fence extents stay intact
+
+    def test_reference_samples_require_exact_identity_unique_positions_and_finite_shapes(self):
+        names = ["minecraft:dandelion", "minecraft:short_grass", "minecraft:bamboo", "minecraft:pointed_dripstone"]
+        rows = [dict(id=i, name=name, position=[j,0,0], offset=[0,0,0], collision=[], outline=[])
+                for i,name in enumerate(names) for j in range(68)]
+        with scratch() as root:
+            catalog = root / "blocks.json"
+            catalog.write_text(json.dumps({name:dict(states=[dict(id=i)]) for i,name in enumerate(names)}))
+            reference = root / "reference.json"; reference.write_text(json.dumps(rows))
+            self.assertEqual(helper.validate_offset_reference(reference, catalog), 272)
+            for changed in range(5):
+                broken = copy.deepcopy(rows)
+                if changed == 0: broken[0]["id"] = 9
+                if changed == 1: broken[0]["position"] = broken[1]["position"]
+                if changed == 2: broken[0]["offset"][0] = float("nan")
+                if changed == 3: broken[0]["outline"] = [[0,0,0,0,1,1]]
+                if changed == 4: broken.pop()
+                reference.write_text(json.dumps(broken))
+                with self.subTest(changed=changed), self.assertRaises(ValueError):
+                    helper.validate_offset_reference(reference, catalog)
+
     def test_bundle_paths_reject_traversal_absolute_and_platform_aliases(self):
         self.assertEqual(str(helper.safe_relative("org/example/library.jar")), "org/example/library.jar")
         for value in ["", "/root.jar", "../bad.jar", "a/../b.jar", "a/./b.jar", "a//b.jar",

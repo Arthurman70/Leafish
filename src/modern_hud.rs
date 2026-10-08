@@ -1,5 +1,5 @@
 //! Native-session HUD using the installed modern hotbar sprites.
-//! Item labels deliberately remain text until item model icons are implemented.
+//! Unsupported item models retain explicit text labels.
 
 use crate::ui::{self, HAttach, VAttach};
 
@@ -20,6 +20,7 @@ pub struct Hud {
     selection: ui::ImageRef,
     _numbers: Vec<ui::TextRef>,
     labels: Vec<ui::TextRef>,
+    icons: Vec<ui::ImageRef>,
     selected_name: ui::TextRef,
     status: ui::TextRef,
     _help: ui::TextRef,
@@ -50,6 +51,7 @@ impl Hud {
             .create(container);
         let mut numbers = Vec::with_capacity(9);
         let mut labels = Vec::with_capacity(9);
+        let mut icons = Vec::with_capacity(9);
         for slot in 0..9 {
             let x = -160.0 + slot as f64 * 40.0;
             numbers.push(
@@ -69,6 +71,16 @@ impl Hud {
                     .position(x, 14.0)
                     .scale_x(0.75)
                     .scale_y(0.75)
+                    .alignment(VAttach::Bottom, HAttach::Center)
+                    .draw_index(12)
+                    .create(container),
+            );
+            icons.push(
+                ui::ImageBuilder::new()
+                    .texture("leafish:solid")
+                    .size(30.0, 30.0)
+                    .position(x, 11.0)
+                    .colour((255, 255, 255, 0))
                     .alignment(VAttach::Bottom, HAttach::Center)
                     .draw_index(12)
                     .create(container),
@@ -159,6 +171,7 @@ impl Hud {
             selection,
             _numbers: numbers,
             labels,
+            icons,
             selected_name,
             status,
             _help: help,
@@ -175,6 +188,7 @@ impl Hud {
     pub fn update(
         &mut self,
         hotbar: [Option<&str>; 9],
+        icons: [Option<&str>; 9],
         selected: usize,
         status: &str,
         picker: Option<PickerView<'_>>,
@@ -189,6 +203,14 @@ impl Hud {
             } else {
                 (245, 245, 245, 255)
             };
+            let mut icon = self.icons[slot].borrow_mut();
+            if let Some(texture) = icons[slot] {
+                icon.texture = texture.to_owned();
+                icon.colour.3 = 255;
+                label.colour.3 = 0;
+            } else {
+                icon.colour.3 = 0;
+            }
         }
         self.selected_name.borrow_mut().text = hotbar[selected]
             .map(display_name)

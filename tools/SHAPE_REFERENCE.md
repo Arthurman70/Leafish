@@ -32,7 +32,9 @@ end in `java.exe` and `javac.exe`.
 
 The successful output directory contains:
 
-- `shapes-v1.json`: the catalog consumed by the client’s `--shape-catalog` option.
+- `shapes-v2.json`: the catalog consumed by the client’s `--shape-catalog` option.
+- `offset-reference.json`: 272 original-runtime offset and shape samples for
+  independently checking the Rust positional geometry implementation.
 - `summary.json`: input, output, and generator SHA-256 hashes and verification counts.
 - `generator.log`: compiler and reference-runtime diagnostics.
 - `classes/` and `reference/`: compiled helper classes and the listed server/library
@@ -70,15 +72,15 @@ those mappings. It enumerates `BuiltInRegistries.BLOCK` states, obtains IDs thro
 with no geometry inferred from resource-pack models.
 
 The verified reference has 26,684 block states. Collision shapes are resolved for
-26,473 states and selection outlines for 26,379. Generation checks these counts
-as well as the complete state identity domain. The schema-v1 report produced by
+26,537 states and selection outlines for 26,505. Generation checks these counts
+as well as the complete state identity domain. The schema-v2 report produced by
 the tested generator has SHA-256
-`f9a7b337abea76a482063e3922b23a78f069e1e20aa40964cff455cfc13b50a1`.
+`f05ce8d2441ecd0d67a0e233aa9b8c9e902f6a3aa4cb8a98267b758ed3f62f76`.
 Each run records its actual report hash separately.
 
 ## Schema and support limits
 
-The report is a JSON object with `schema_version: 1`, `minecraft_version: "1.21.1"`,
+The report is a JSON object with `schema_version: 2`, `minecraft_version: "1.21.1"`,
 `block_catalog_sha256`, `official_server_sha256`, `official_server_mappings_sha256`,
 `generator`, `collision_resolved`, `outline_resolved`, and a dense `states` array.
 Entry `states[n]` has `id: n`; the loader must still validate its exact name and
@@ -92,22 +94,45 @@ properties against the supplied catalog.
 | `collision` | Collision AABB array, or explicit `null` when unresolved. |
 | `outline` | Selection AABB array, or explicit `null` when unresolved. |
 | `collision_unresolved`, `outline_unresolved` | Reason string for the corresponding `null`, otherwise explicit `null`. |
+| `movement` | Original `Block.getFriction`, `getSpeedFactor`, and `getJumpFactor` values, named `friction`, `speed_factor`, and `jump_factor`. Cast back to `f32` for Java float arithmetic. |
+| `offset` | `null`, or an `xz`/`xyz` descriptor containing `kind`, `max_horizontal`, and `max_vertical`. |
+| `collision_offset`, `outline_offset` | Whether that shape, independently of the artwork, uses the positional offset. |
+| `collision_context` | `independent`, or the explicitly tested `vanilla_player_no_fluid_standing` fluid context. |
 
 Each box has six finite numbers in block-local units:
 `[minX, minY, minZ, maxX, maxY, maxZ]`. Extents are preserved, including fence
 collision boxes reaching 1.5 blocks high. An empty array means a resolved empty
 shape; `null` means unresolved and must never become air or a guessed cube.
 
-For non-dynamic states, the generator compares Minecraft’s cached collision
-shape with a direct method call. The direct call uses context objects that throw
-on world or player-context queries. Outlines are also rejected when the state has
-a position-dependent offset. Dynamic states remain unresolved before either
-method is queried.
+For ordinary non-dynamic states, the generator compares Minecraft’s cached
+collision shape with a direct method call. The direct call uses context objects
+that throw on world or player-context queries. Other execution failures stop
+validation instead of being accepted as an ordinary unresolved case.
 
-These deliberate exclusions include moving pistons, shulker boxes, scaffolding,
-powder snow and some offset plants. Fluid collision queries and held-item-dependent
-light-block outlines also remain unresolved. Other execution failures cause
-validation to fail instead of being accepted as an ordinary unresolved case.
+For offset-bearing states, it calls the original offset, collision, and outline
+methods at 68 positions, including negative coordinates and both world edges.
+The descriptor follows `BlockBehaviour.Properties.offsetType` and `Mth.getSeed`,
+including the overflowing Java integer multiplication and float division. Each
+geometry must either stay constant or translate exactly by that offset. Bamboo
+and pointed dripstone can therefore have a position-dependent collision shape;
+short grass can move its artwork while retaining a constant selection outline.
+The client applies shape and artwork offsets separately, once each.
+
+Water and lava use the original `EntityCollisionContext` and collision methods.
+The context uses an empty held item and the inherited vanilla player's
+`canStandOnFluid` result of false. All 32 states produce an empty collision shape
+at the tested foot heights. This permits passage through these cells; it does
+not implement swimming, buoyancy, drag, damage, or non-player fluid support.
+
+Moving pistons, shulker boxes, scaffolding, powder snow and other contextual
+dynamic shapes remain unresolved: 147 collision states and those same 147
+selection states, plus 32 held-item-dependent light-block outlines. The loader
+does not replace these with air or full cubes.
+
+The client still accepts schema-one reports for previously resolved geometry.
+Schema one cannot provide offset-dependent geometry or movement factors; calls
+requiring that information fail explicitly. Regenerate schema two to use the
+updated movement and plant support. A schema-one file is never silently upgraded.
 
 This is a static vanilla shape reference. It does not implement dynamic block
 behavior, entities, fluids, complete player physics, NeoForge, or mod shapes. It
@@ -122,3 +147,21 @@ python -B tools/test_generate_shapes.py
 
 The full reference generation command above is the integration check. It requires
 the original inputs, which are intentionally absent from the repository.
+
+After generating the files, the optional Rust geometry comparison uses these
+environment variables (set them using your shell's usual syntax):
+
+```text
+LEAFISH_BLOCK_REFERENCE=/path/to/local-reference/generated/reports/blocks.json
+LEAFISH_SHAPE_REFERENCE=/path/to/local-shapes/shapes-v2.json
+LEAFISH_OFFSET_REFERENCE=/path/to/local-shapes/offset-reference.json
+cargo test -p leafish modern_shapes::tests::installed_positional_shapes_match_original_runtime -- --ignored
+```
+
+That comparison checks all 272 original method samples and every water/lava state.
+Ordinary Rust tests also check negative/world-edge offset arithmetic, schema
+rejection, collision-free fluid passage, and candidate-height stepping over
+slabs, including low ceilings, height limits, and a falling starting position.
+The stepper follows the 1.21.1 `Entity.collide` candidate ordering. Entity
+collisions, world-border collision, contextual dynamic shapes and complete
+player movement remain separate work.

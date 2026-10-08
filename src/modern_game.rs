@@ -1,8 +1,10 @@
 //! Local vanilla 1.21.1 creative session using exact native identities.
 //! This path is separate from the legacy client and never authenticates remotely.
-use crate::model::{native_mesh, Factory};
+use crate::model::{icons::IconCache, native_mesh, Factory};
 use crate::modern_controls;
 use crate::modern_hud::{Hud, PickerView, PICKER_ROWS};
+use crate::modern_interaction::HeldInteraction;
+use crate::modern_motion;
 use crate::modern_shapes::{self, ShapeCatalog};
 use crate::render::{ChunkBuffer, Renderer};
 use crate::server::modern::{LocalTransform, ModernConnection, ModernEvent, ModernEvents};
@@ -30,6 +32,14 @@ type Result<T> = std::result::Result<T, String>;
 type Section = (i32, i32, i32);
 // Vanilla 1.21.1 block_interaction_range 4.5 + Creative modifier 0.5.
 const CREATIVE_REACH: f64 = 5.0;
+// A single block item is valid even for signs and unstackable shulker boxes.
+// Creative placement does not consume it; item stack-limit metadata is pending.
+const PICKER_COUNT: u8 = 1;
+const CHECK_PICKER_ITEMS: [&str; 3] = [
+    "minecraft:oak_sign",
+    "minecraft:shulker_box",
+    "minecraft:oak_planks",
+];
 #[derive(Default)]
 struct PlayCheck {
     stage: u8,
@@ -37,6 +47,7 @@ struct PlayCheck {
     origin: Option<[f64; 3]>,
     target: Option<[i32; 3]>,
     initial_state: Option<u32>,
+    picker_probe: usize,
     completed: bool,
 }
 const HOTBAR: [&str; 9] = [
@@ -50,6 +61,17 @@ const HOTBAR: [&str; 9] = [
     "sand",
     "torch",
 ];
+
+#[derive(Default)]
+struct MotionCheck {
+    stage: u8,
+    stage_started: Option<Instant>,
+    origin: Option<[f64; 3]>,
+    step_peak: f64,
+    jump_base: f64,
+    jump_peak: f64,
+    completed: bool,
+}
 
 struct BlockPicker {
     query: String,
@@ -114,6 +136,7 @@ pub struct ModernSession {
     items: Arc<Vec<String>>,
     store: Option<NativeChunkStore>,
     models: Arc<RwLock<Factory>>,
+    icons: IconCache,
     tints: native_mesh::BiomeTints,
     buffers: BTreeMap<Section, Arc<RwLock<ChunkBuffer>>>,
     dirty: BTreeSet<Section>,
@@ -122,8 +145,16 @@ pub struct ModernSession {
     hotbar: [Option<PlainItemStack>; 9],
     selected: u8,
     provisioned: bool,
+    inventory_received: bool,
     flight_requested: bool,
     flight: modern_controls::FlightController,
+    ground: modern_controls::GroundController,
+    flight_toggle: modern_controls::FlightToggle,
+    motion_clock: f64,
+    grounded: bool,
+    entity_id: Option<i32>,
+    sprinting: bool,
+    interactions: HeldInteraction,
     pressed: [bool; 7],
     paused: bool,
     window_focused: bool,
@@ -142,6 +173,7 @@ pub struct ModernSession {
     pub block_updates: usize,
     pub action_acks: usize,
     check: Option<PlayCheck>,
+    motion_check: Option<MotionCheck>,
 }
 
 fn read_bounded(path: &Path) -> Result<Vec<u8>> {
@@ -226,6 +258,11 @@ impl ModernSession {
             .alignment(ui::VAttach::Middle, ui::HAttach::Center)
             .draw_index(10)
             .create(ui);
+        let models = Arc::new(RwLock::new(Factory::new(
+            renderer.resources.clone(),
+            renderer.get_textures(),
+        )));
+        let icons = IconCache::new(renderer.resources.clone(), models.clone());
         Ok(Self {
             connection,
             events,
@@ -233,10 +270,8 @@ impl ModernSession {
             shapes,
             items,
             store: None,
-            models: Arc::new(RwLock::new(Factory::new(
-                renderer.resources.clone(),
-                renderer.get_textures(),
-            ))),
+            models,
+            icons,
             tints,
             buffers: BTreeMap::new(),
             dirty: BTreeSet::new(),
@@ -245,8 +280,16 @@ impl ModernSession {
             hotbar: Default::default(),
             selected: 0,
             provisioned: false,
+            inventory_received: false,
             flight_requested: false,
             flight: modern_controls::FlightController::new(),
+            ground: modern_controls::GroundController::new(),
+            flight_toggle: modern_controls::FlightToggle::default(),
+            motion_clock: 0.0,
+            grounded: false,
+            entity_id: None,
+            sprinting: false,
+            interactions: HeldInteraction::default(),
             pressed: [false; 7],
             paused: false,
             window_focused: true,
@@ -265,6 +308,7 @@ impl ModernSession {
             block_updates: 0,
             action_acks: 0,
             check: None,
+            motion_check: None,
         })
     }
 
@@ -275,6 +319,9 @@ impl ModernSession {
         self.paused = true;
         self.pressed = [false; 7];
         self.flight.reset_motion();
+        self.ground.reset_motion();
+        self.flight_toggle.reset();
+        self.interactions.clear();
     }
 
     fn mark_chunk(&mut self, x: i32, z: i32) {
@@ -306,6 +353,7 @@ impl ModernSession {
                         "This local client milestone requires the isolated Creative world".into(),
                     );
                 }
+                self.entity_id = Some(join.entity_id);
                 self.store = Some(
                     NativeChunkStore::new(context, self.catalog.clone())
                         .map_err(|e| e.to_string())?,
@@ -318,6 +366,9 @@ impl ModernSession {
             ModernEvent::Teleported { transform, .. } => {
                 self.transform = Some(transform);
                 self.flight.reset_motion();
+                self.ground.reset_motion();
+                self.flight_toggle.reset();
+                self.motion_clock = 0.0;
             }
             ModernEvent::Chunk(chunk) => {
                 let (x, z) = (chunk.x, chunk.z);
@@ -382,6 +433,7 @@ impl ModernSession {
             }
             ModernEvent::InventoryContent(content) => {
                 if content.container_id == 0 {
+                    self.inventory_received = true;
                     for i in 0..9 {
                         self.hotbar[i] = content.slots.get(36 + i).cloned().flatten();
                     }
@@ -423,28 +475,70 @@ impl ModernSession {
             return Err("Local server has not granted Creative abilities".into());
         }
         if !self.flight_requested {
-            self.connection
-                .send(play::Serverbound::Flying(true))
-                .map_err(|e| e.to_string())?;
             self.flight_requested = true;
-            // Vanilla grants may_fly; the local player toggles flight and informs
-            // the server. That request does not have a separate acknowledgment.
-            if let Some(abilities) = self.abilities.as_mut() {
-                abilities.flying = true;
-                self.flight.set_abilities(true, abilities);
+            if self.check.is_some() {
+                self.set_flying(true)?;
             }
         }
-        if !self.provisioned {
-            for (i, item) in HOTBAR.iter().enumerate() {
+        if !self.provisioned && self.inventory_received {
+            // Seed a new empty profile only. Reopening a saved world preserves
+            // the player's server-owned hotbar and selection.
+            if self.hotbar.iter().all(Option::is_none) {
+                for (i, item) in HOTBAR.iter().enumerate() {
+                    self.connection
+                        .set_creative_hotbar_slot(i as u8, &format!("minecraft:{item}"), 64)
+                        .map_err(|e| e.to_string())?;
+                }
                 self.connection
-                    .set_creative_hotbar_slot(i as u8, &format!("minecraft:{item}"), 64)
+                    .send(play::Serverbound::SelectedSlot(0))
                     .map_err(|e| e.to_string())?;
             }
-            self.connection
-                .send(play::Serverbound::SelectedSlot(0))
-                .map_err(|e| e.to_string())?;
             self.provisioned = true;
         }
+        Ok(())
+    }
+
+    fn set_flying(&mut self, flying: bool) -> Result<()> {
+        let Some(mut abilities) = self.abilities.clone() else {
+            return Ok(());
+        };
+        if flying && !abilities.may_fly {
+            return Ok(());
+        }
+        if flying == abilities.flying {
+            return Ok(());
+        }
+        let mut velocity = if flying {
+            self.ground.velocity()
+        } else {
+            self.flight.velocity()
+        };
+        if flying && self.grounded {
+            if let (Some(store), Some(transform)) = (&self.store, &self.transform) {
+                let environment =
+                    modern_motion::environment(store, &self.shapes, transform.position)?;
+                velocity[1] = (0.42_f32 * environment.jump_factor) as f64;
+                if self.sprinting {
+                    let (sin, cos) = modern_controls::movement_yaw(transform.rotation[0]);
+                    velocity[0] -= sin * 0.2;
+                    velocity[2] += cos * 0.2;
+                }
+            }
+        }
+        self.connection
+            .send(play::Serverbound::Flying(flying))
+            .map_err(|e| e.to_string())?;
+        abilities.flying = flying;
+        self.flight.set_abilities(true, &abilities);
+        if flying {
+            self.flight.reset_motion();
+            self.flight.set_velocity(velocity);
+        } else {
+            self.ground.reset_motion();
+            self.ground.set_velocity(velocity);
+            self.ground.set_sprinting(self.sprinting);
+        }
+        self.abilities = Some(abilities);
         Ok(())
     }
 
@@ -453,36 +547,131 @@ impl ModernSession {
             if self.transform.as_ref().map(|t| t.generation) != Some(authoritative.generation) {
                 self.transform = Some(authoritative);
                 self.flight.reset_motion();
+                self.ground.reset_motion();
+                self.flight_toggle.reset();
+                self.motion_clock = 0.0;
             }
         }
-        let Some(transform) = self.transform.as_mut() else {
+        let Some(mut transform) = self.transform.clone() else {
             return Ok(());
         };
-        if !self.paused && self.picker.is_none() && self.window_focused && self.flight_requested {
-            let axes = modern_controls::Axes {
-                forward: self.pressed[0] as u8 as f64 - self.pressed[1] as u8 as f64,
-                right: self.pressed[3] as u8 as f64 - self.pressed[2] as u8 as f64,
-                up: self.pressed[4] as u8 as f64 - self.pressed[5] as u8 as f64,
-                sprint: self.pressed[6],
-            };
-            let candidate =
-                self.flight
-                    .advance(transform.position, transform.rotation, axes, seconds);
-            if let Some(store) = &self.store {
-                let delta = std::array::from_fn(|a| candidate[a] - transform.position[a]);
-                match modern_shapes::move_player(store, &self.shapes, transform.position, delta) {
-                    Ok(movement) => {
-                        transform.position = movement.position;
-                        self.flight.clip_motion(movement.blocked);
-                        self.notice = None;
-                    }
-                    Err(error) => {
-                        self.flight.reset_motion();
-                        self.notice = Some(error.to_string());
+        if !self.paused && self.window_focused && self.flight_requested {
+            self.motion_clock += seconds.min(0.1);
+            while self.motion_clock + 1e-12 >= 0.05 {
+                self.motion_clock = (self.motion_clock - 0.05).max(0.0);
+                let active = self.picker.is_none();
+                let forward = if active {
+                    self.pressed[0] as u8 as f64 - self.pressed[1] as u8 as f64
+                } else {
+                    0.0
+                };
+                let axes = modern_controls::Axes {
+                    forward,
+                    right: if active {
+                        self.pressed[3] as u8 as f64 - self.pressed[2] as u8 as f64
+                    } else {
+                        0.0
+                    },
+                    up: if active {
+                        self.pressed[4] as u8 as f64 - self.pressed[5] as u8 as f64
+                    } else {
+                        0.0
+                    },
+                    sprint: active && self.pressed[6] && forward > 0.0,
+                };
+                if let Some(abilities) = &self.abilities {
+                    if let Some(flying) = self.flight_toggle.tick(
+                        active && self.pressed[4],
+                        abilities.may_fly,
+                        abilities.flying,
+                    ) {
+                        self.transform = Some(transform.clone());
+                        self.set_flying(flying)?;
                     }
                 }
+                let flying = self.abilities.as_ref().is_some_and(|a| a.flying);
+                let mut actual_sprint = axes.sprint;
+                if let Some(store) = &self.store {
+                    let moved = if flying {
+                        let mut flight_axes = axes;
+                        flight_axes.sprint = axes.forward > 0.0 && (axes.sprint || self.sprinting);
+                        actual_sprint = flight_axes.sprint;
+                        let candidate = self.flight.advance(
+                            transform.position,
+                            transform.rotation,
+                            flight_axes,
+                            0.05,
+                        );
+                        let delta = std::array::from_fn(|a| candidate[a] - transform.position[a]);
+                        modern_shapes::move_player(store, &self.shapes, transform.position, delta)
+                            .map(|movement| {
+                                self.flight.clip_motion(movement.blocked);
+                                self.grounded = delta[1] < 0.0 && movement.blocked[1];
+                                movement.position
+                            })
+                            .map_err(|e| e.to_string())
+                    } else {
+                        let shapes = &self.shapes;
+                        self.ground
+                            .advance(
+                                transform.position,
+                                transform.rotation,
+                                modern_controls::GroundInput {
+                                    axes,
+                                    jump: active && self.pressed[4],
+                                },
+                                modern_controls::GroundSettings::default(),
+                                0.05,
+                                |p| modern_motion::environment(store, shapes, p),
+                                |p, d| modern_motion::collide(store, shapes, p, d),
+                            )
+                            .map(|movement| {
+                                self.grounded = movement.grounded;
+                                actual_sprint = movement.sprinting;
+                                movement.position
+                            })
+                    };
+                    match moved {
+                        Ok(position) => {
+                            transform.position = position;
+                            self.notice = None;
+                            if let Some(check) = self.motion_check.as_mut() {
+                                if check.stage == 1 {
+                                    check.step_peak = check.step_peak.max(position[1]);
+                                }
+                                if matches!(check.stage, 3 | 4) {
+                                    check.jump_peak = check.jump_peak.max(position[1]);
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            self.flight.reset_motion();
+                            self.ground.reset_motion();
+                            self.grounded = false;
+                            self.notice = Some(error);
+                        }
+                    }
+                }
+                if self.sprinting != actual_sprint {
+                    if let Some(entity_id) = self.entity_id {
+                        self.connection
+                            .send(play::Serverbound::PlayerCommand {
+                                entity_id,
+                                action: if actual_sprint { 3 } else { 4 },
+                            })
+                            .map_err(|e| e.to_string())?;
+                    }
+                    self.sprinting = actual_sprint;
+                }
+                if flying && self.grounded {
+                    self.transform = Some(transform.clone());
+                    self.set_flying(false)?;
+                }
             }
+        } else {
+            self.motion_clock = 0.0;
         }
+        self.transform = Some(transform.clone());
         if let Err(error) = self.connection.update_local_transform(transform.clone()) {
             if let Some(current) = self.connection.local_transform() {
                 self.transform = Some(current);
@@ -492,7 +681,7 @@ impl ModernSession {
         }
         if self.last_move.elapsed() >= Duration::from_millis(50) {
             self.last_move = Instant::now();
-            if let Err(error) = self.connection.move_player(transform.clone(), false) {
+            if let Err(error) = self.connection.move_player(transform, self.grounded) {
                 if let Some(current) = self.connection.local_transform() {
                     self.transform = Some(current);
                     return Ok(());
@@ -528,7 +717,10 @@ impl ModernSession {
                 }
             }
             if self.error.is_none() {
-                if let Err(error) = self.advance_check() {
+                if let Err(error) = self
+                    .advance_check()
+                    .and_then(|_| self.advance_motion_check())
+                {
                     self.fail(error);
                 }
                 if let Err(error) = self
@@ -538,6 +730,7 @@ impl ModernSession {
                     self.fail(error);
                 }
             }
+            self.repeat_interactions(seconds);
             let mesh_start = Instant::now();
             for _ in 0..4 {
                 let Some(store) = &self.store else {
@@ -563,7 +756,13 @@ impl ModernSession {
                 {
                     continue;
                 }
-                match native_mesh::build_section(store, pos, &self.models, &self.tints) {
+                match native_mesh::build_section_with_shapes(
+                    store,
+                    pos,
+                    &self.models,
+                    &self.tints,
+                    &self.shapes,
+                ) {
                     Ok(mesh) => {
                         self.unsupported.extend(mesh.unsupported_states);
                         self.unsupported.extend(mesh.missing_tint_states);
@@ -634,7 +833,7 @@ impl ModernSession {
         } else if let Some(notice) = &self.notice {
             format!("Local play: {notice}")
         } else {
-            "Minecraft 1.21.1 | Creative | WASD move | Space/Shift fly | Mouse break/place"
+            "Minecraft 1.21.1 | Creative | WASD move | Space jump | Double-Space flight | Mouse build"
                 .to_owned()
         };
         let inventory = &self.hotbar;
@@ -662,8 +861,15 @@ impl ModernSession {
             total: picker.matches.len(),
         });
         self.crosshair.borrow_mut().colour.3 = if self.picker.is_some() { 0 } else { 255 };
-        self.hud
-            .update(hotbar, self.selected as usize, &status, picker_view);
+        let icons = self.icons.hotbar_textures(&self.catalog, hotbar);
+        let icon_refs = std::array::from_fn(|slot| icons[slot].as_deref());
+        self.hud.update(
+            hotbar,
+            icon_refs,
+            self.selected as usize,
+            &status,
+            picker_view,
+        );
         ui.tick(
             game.renderer.clone(),
             seconds * 60.0,
@@ -698,17 +904,131 @@ impl ModernSession {
                 && self.store.as_ref().is_some_and(|s| s.len() > 0)
                 && self.dirty.is_empty()
                 && !self.buffers.is_empty()
-                && self.check.as_ref().map_or(true, |c| c.completed))
+                && self.check.as_ref().map_or(true, |c| c.completed)
+                && self.motion_check.as_ref().map_or(true, |c| c.completed))
     }
 
     pub fn report(&self) -> serde_json::Value {
         serde_json::json!({"protocol":767,"connected":self.connection.is_connected(),"chunks":self.store.as_ref().map_or(0,|s|s.len()),"meshes":self.buffers.len(),"pending_meshes":self.dirty.len(),"movement_packets":self.movement_sent,"block_updates":self.block_updates,"action_acknowledgments":self.action_acks,"unsupported_visual_states":self.unsupported,"error":self.error,"position":self.transform.as_ref().map(|t|t.position),"selected_item":self.hotbar[self.selected as usize].as_ref().and_then(|s|self.items.get(s.item_id as usize)),"full_gameplay_parity":false,
-        "selected_slot":self.selected,"creative_block_choices":self.block_choices.len(),"creative_choices_confirmed":self.choices_confirmed,"pending_creative_choice":self.pending_choice,
+        "selected_slot":self.selected,"flying":self.abilities.as_ref().map(|a|a.flying),"grounded":self.grounded,"motion_check":self.motion_check.as_ref().map(|c|serde_json::json!({"completed":c.completed,"stage":c.stage,"origin":c.origin,"step_peak":c.step_peak,"jump_base":c.jump_base,"jump_peak":c.jump_peak})),
+        "creative_block_choices":self.block_choices.len(),"creative_choices_confirmed":self.choices_confirmed,"pending_creative_choice":self.pending_choice,
         "interaction_check":self.check.as_ref().map(|c|serde_json::json!({"completed":c.completed,"stage":c.stage,"initial_position":c.origin,"target":c.target,"initial_state":c.initial_state,"final_state":c.target.and_then(|p|self.store.as_ref().and_then(|s|s.block_state_id(Position::new(p[0],p[1],p[2]))))}))})
     }
 
     pub fn enable_verification(&mut self) {
         self.check = Some(PlayCheck::default());
+    }
+
+    pub fn enable_motion_verification(&mut self) {
+        self.motion_check = Some(MotionCheck::default());
+    }
+
+    fn advance_motion_check(&mut self) -> Result<()> {
+        let Some(mut check) = self.motion_check.take() else {
+            return Ok(());
+        };
+        let result = (|| -> Result<()> {
+            if check.completed {
+                return Ok(());
+            }
+            if self.started.elapsed() > Duration::from_secs(90) {
+                return Err(format!(
+                    "Motion verification timed out at stage {}",
+                    check.stage
+                ));
+            }
+            let Some(position) = self.transform.as_ref().map(|t| t.position) else {
+                return Ok(());
+            };
+            let elapsed = check.stage_started.map_or(Duration::ZERO, |t| t.elapsed());
+            match check.stage {
+                0 if self.started.elapsed() > Duration::from_secs(5)
+                    && self.provisioned
+                    && self.dirty.is_empty() =>
+                {
+                    self.set_flying(false)?;
+                    self.flight.reset_motion();
+                    self.ground.reset_motion();
+                    self.flight_toggle.reset();
+                    check.origin = Some(position);
+                    check.step_peak = position[1];
+                    self.pressed = [false; 7];
+                    self.pressed[0] = true;
+                    check.stage = 1;
+                    check.stage_started = Some(Instant::now());
+                }
+                1 => {
+                    check.step_peak = check.step_peak.max(position[1]);
+                    if position[2] - check.origin.unwrap()[2] >= 6.0 {
+                        if check.step_peak - check.origin.unwrap()[1] < 0.49 {
+                            return Err("Walking did not step onto the reference half-slab".into());
+                        }
+                        self.pressed = [false; 7];
+                        self.ground.reset_motion();
+                        check.stage = 2;
+                        check.stage_started = Some(Instant::now());
+                    }
+                }
+                2 if self.grounded && elapsed > Duration::from_millis(250) => {
+                    check.jump_base = position[1];
+                    check.jump_peak = position[1];
+                    self.pressed[4] = true;
+                    check.stage = 3;
+                    check.stage_started = Some(Instant::now());
+                }
+                3 => {
+                    check.jump_peak = check.jump_peak.max(position[1]);
+                    if elapsed > Duration::from_millis(100) {
+                        self.pressed[4] = false;
+                        check.stage = 4;
+                        check.stage_started = Some(Instant::now());
+                    }
+                }
+                4 => {
+                    check.jump_peak = check.jump_peak.max(position[1]);
+                    if self.grounded && elapsed > Duration::from_millis(200) {
+                        let height = check.jump_peak - check.jump_base;
+                        if (height - 1.2522033402537238).abs() > 1e-6 {
+                            return Err(format!("Reference jump height mismatch: {height}"));
+                        }
+                        self.pressed[4] = true;
+                        check.stage = 5;
+                        check.stage_started = Some(Instant::now());
+                    }
+                }
+                5 if elapsed > Duration::from_millis(100) => {
+                    self.pressed[4] = false;
+                    check.stage = 6;
+                    check.stage_started = Some(Instant::now());
+                }
+                6 if elapsed > Duration::from_millis(100) => {
+                    self.pressed[4] = true;
+                    check.stage = 7;
+                    check.stage_started = Some(Instant::now());
+                }
+                7 if self.abilities.as_ref().is_some_and(|a| a.flying)
+                    && position[1] - check.jump_base >= 2.0 =>
+                {
+                    self.pressed = [false; 7];
+                    self.flight.reset_motion();
+                    self.ground.reset_motion();
+                    check.stage = 8;
+                    check.stage_started = Some(Instant::now());
+                    if let Some(t) = self.transform.as_mut() {
+                        t.rotation = [0.0, 35.0];
+                    }
+                }
+                8 if elapsed > Duration::from_millis(300) => {
+                    check.completed = true;
+                    check.stage = 9;
+                    log::info!("Native walking, half-slab step, jump/landing and double-tap flight verified");
+                }
+                _ => {}
+            }
+            Ok(())
+        })();
+        self.motion_check = Some(check);
+        result
     }
 
     /// Opt-in test driver sends the same controls/actions as the game. It never
@@ -791,20 +1111,27 @@ impl ModernSession {
                         .is_some_and(|s| is_air(s.name()))
                         && self.action_acks >= 1
                     {
-                        // Exercise the same inventory request as the Creative
-                        // picker, replacing stone rather than reusing a preset.
                         self.select(0);
-                        self.open_picker();
-                        self.picker_key(&Key::Character("minecraft:oak_planks".into()));
-                        let picker = self.picker.as_ref().ok_or("Block picker did not open")?;
-                        if picker.matches.len() != 1
-                            || self.block_choices[picker.matches[0]] != "minecraft:oak_planks"
-                        {
-                            return Err("Block picker search did not select oak planks".into());
-                        }
-                        check.stage_started = Some(Instant::now());
-                        check.stage = 6;
+                        check.stage = 7;
                     }
+                }
+                7 => {
+                    // Prove small-stack and unstackable items cannot wedge the
+                    // real picker before selecting the final placement block.
+                    let requested = CHECK_PICKER_ITEMS[check.picker_probe];
+                    self.open_picker();
+                    self.picker_key(&Key::Character(requested.into()));
+                    let picker = self.picker.as_ref().ok_or("Block picker did not open")?;
+                    let index = picker
+                        .matches
+                        .iter()
+                        .position(|&candidate| self.block_choices[candidate] == requested)
+                        .ok_or_else(|| format!("Block picker search did not find {requested}"))?;
+                    for _ in 0..index {
+                        self.picker_key(&Key::Named(NamedKey::ArrowDown));
+                    }
+                    check.stage_started = Some(Instant::now());
+                    check.stage = 6;
                 }
                 6 if check.stage_started.unwrap().elapsed() > Duration::from_millis(250) => {
                     if !self.confirm_picker()? {
@@ -813,14 +1140,20 @@ impl ModernSession {
                     check.stage = 5;
                 }
                 5 if self.pending_choice.is_none()
-                    && self.choices_confirmed > 0
+                    && self.choices_confirmed > check.picker_probe
                     && self.hotbar[self.selected as usize]
                         .as_ref()
+                        .filter(|stack| stack.count == PICKER_COUNT as u32)
                         .and_then(|stack| self.items.get(stack.item_id as usize))
-                        .is_some_and(|name| name == "minecraft:oak_planks") =>
+                        .is_some_and(|name| name == CHECK_PICKER_ITEMS[check.picker_probe]) =>
                 {
-                    self.interact(true);
-                    check.stage = 3;
+                    if check.picker_probe + 1 < CHECK_PICKER_ITEMS.len() {
+                        check.picker_probe += 1;
+                        check.stage = 7;
+                    } else {
+                        self.interact(true);
+                        check.stage = 3;
+                    }
                 }
                 3 => {
                     let p = check.target.unwrap();
@@ -881,7 +1214,7 @@ impl ModernSession {
         if self.hotbar[self.selected as usize]
             .as_ref()
             .is_some_and(|stack| {
-                stack.count == 64
+                stack.count > 0
                     && self
                         .items
                         .get(stack.item_id as usize)
@@ -891,7 +1224,7 @@ impl ModernSession {
             return Ok(());
         }
         self.connection
-            .set_creative_hotbar_slot(self.selected, name, 64)
+            .set_creative_hotbar_slot(self.selected, name, PICKER_COUNT)
             .map_err(|error| error.to_string())?;
         self.pending_choice = Some((self.selected, name.to_owned()));
         Ok(())
@@ -905,7 +1238,7 @@ impl ModernSession {
                 updated_slot.map_or(true, |updated| updated == *slot)
                     && self.hotbar[*slot as usize]
                         .as_ref()
-                        .filter(|stack| stack.count == 64)
+                        .filter(|stack| stack.count == PICKER_COUNT as u32)
                         .and_then(|stack| self.items.get(stack.item_id as usize))
                         == Some(requested)
             });
@@ -929,12 +1262,18 @@ impl ModernSession {
         self.picker = Some(BlockPicker::new(&self.block_choices));
         self.pressed = [false; 7];
         self.flight.reset_motion();
+        self.ground.reset_motion();
+        self.flight_toggle.reset();
+        self.interactions.clear();
     }
 
     fn close_picker(&mut self) {
         self.picker = None;
         self.pressed = [false; 7];
         self.flight.reset_motion();
+        self.ground.reset_motion();
+        self.flight_toggle.reset();
+        self.interactions.clear();
     }
 
     fn confirm_picker(&mut self) -> Result<bool> {
@@ -993,33 +1332,35 @@ impl ModernSession {
         }
     }
 
-    fn interact(&mut self, place: bool) {
-        if self.paused || self.picker.is_some() || self.error.is_some() {
-            return;
-        }
-        let Some(transform) = &self.transform else {
-            return;
-        };
-        let Some(store) = &self.store else {
-            return;
+    fn target(&self) -> Result<Option<modern_shapes::Hit>> {
+        let (Some(transform), Some(store)) = (&self.transform, &self.store) else {
+            return Ok(None);
         };
         let origin = [
             transform.position[0],
             transform.position[1] + 1.62,
             transform.position[2],
         ];
-        let hit = match modern_shapes::raycast(
+        modern_shapes::raycast(
             store,
             &self.shapes,
             origin,
             modern_controls::view_direction(transform.rotation),
             CREATIVE_REACH,
-        ) {
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    fn interact(&mut self, place: bool) -> bool {
+        if self.paused || self.picker.is_some() || self.error.is_some() {
+            return false;
+        }
+        let hit = match self.target() {
             Ok(Some(hit)) => hit,
-            Ok(None) => return,
+            Ok(None) => return false,
             Err(error) => {
-                self.notice = Some(error.to_string());
-                return;
+                self.notice = Some(error);
+                return false;
             }
         };
         let result = if place {
@@ -1030,8 +1371,29 @@ impl ModernSession {
         };
         if let Err(error) = result {
             self.fail(error);
+            false
         } else {
             let _ = self.connection.send(play::Serverbound::Swing { hand: 0 });
+            true
+        }
+    }
+
+    fn repeat_interactions(&mut self, seconds: f64) {
+        if self.paused || self.picker.is_some() || !self.window_focused || self.error.is_some() {
+            self.interactions.clear();
+            return;
+        }
+        for _ in 0..self.interactions.frame_ticks(seconds) {
+            let target = self.target().is_ok_and(|hit| hit.is_some());
+            let [attack, place] = self.interactions.tick(target);
+            if place {
+                let sent = self.interact(true);
+                self.interactions.started(true, sent);
+            }
+            if attack {
+                let sent = self.interact(false);
+                self.interactions.started(false, sent);
+            }
         }
     }
     pub fn event<T>(&mut self, window: &Window, game: &Game, event: Event<T>) -> bool {
@@ -1060,6 +1422,9 @@ impl ModernSession {
                         self.pressed = [false; 7];
                         self.paused = true;
                         self.flight.reset_motion();
+                        self.ground.reset_motion();
+                        self.flight_toggle.reset();
+                        self.interactions.clear();
                     }
                 }
                 WindowEvent::KeyboardInput { event, .. } => {
@@ -1092,6 +1457,9 @@ impl ModernSession {
                         self.paused = !self.paused;
                         self.pressed = [false; 7];
                         self.flight.reset_motion();
+                        self.ground.reset_motion();
+                        self.flight_toggle.reset();
+                        self.interactions.clear();
                     } else if down && !event.repeat && action == Some(Actionkey::OpenInv) {
                         self.open_picker();
                     } else {
@@ -1119,15 +1487,23 @@ impl ModernSession {
                         }
                     }
                 }
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    button,
-                    ..
-                } if game.is_focused() && self.picker.is_none() => match button {
-                    MouseButton::Left => self.interact(false),
-                    MouseButton::Right => self.interact(true),
-                    _ => {}
-                },
+                WindowEvent::MouseInput { state, button, .. } => {
+                    let place = match button {
+                        MouseButton::Left => Some(false),
+                        MouseButton::Right => Some(true),
+                        _ => None,
+                    };
+                    if let Some(place) = place {
+                        let down = state == ElementState::Pressed
+                            && game.is_focused()
+                            && self.picker.is_none();
+                        self.interactions.set(place, down);
+                        if down {
+                            let sent = self.interact(place);
+                            self.interactions.started(place, sent);
+                        }
+                    }
+                }
                 WindowEvent::MouseWheel { delta, .. } => {
                     let y = match delta {
                         MouseScrollDelta::LineDelta(_, y) => y as f64,

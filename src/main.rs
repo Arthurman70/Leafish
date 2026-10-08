@@ -21,6 +21,8 @@ mod console;
 mod modern_controls;
 mod modern_game;
 mod modern_hud;
+mod modern_interaction;
+mod modern_motion;
 mod modern_shapes;
 mod native_probe;
 mod render_check;
@@ -349,6 +351,15 @@ struct Opt {
     /// Drive a bounded movement/break/place check in the disposable local world
     #[structopt(long, requires = "local-world", requires = "capture-frame")]
     verify_local_play: bool,
+
+    /// Drive walking, stepping, jump/landing and flight checks in a prepared disposable world
+    #[structopt(
+        long,
+        requires = "local-world",
+        requires = "capture-frame",
+        conflicts_with = "verify-local-play"
+    )]
+    verify_local_motion: bool,
 }
 
 // TODO: Hide own character and show only the right hand. (with an item)
@@ -599,6 +610,9 @@ fn main() {
             Ok(mut session) => {
                 if opt.verify_local_play {
                     session.enable_verification();
+                }
+                if opt.verify_local_motion {
+                    session.enable_motion_verification();
                 }
                 *game.modern.lock() = Some(session);
             }

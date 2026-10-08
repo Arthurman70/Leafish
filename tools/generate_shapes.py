@@ -106,10 +106,83 @@ def extract_reference(archive, output):
     return inner, libraries
 
 
+def validate_state(state):
+    """Validate one schema-two state before accepting runtime output."""
+    require(type(state.get("dynamic")) is bool and type(state.get("has_offset")) is bool,
+            "Missing explicit dynamic/offset flags")
+    movement = state.get("movement")
+    require(type(movement) is dict and set(movement) == {"friction", "speed_factor", "jump_factor"}
+            and all(type(v) in (int, float) and math.isfinite(v) and 0 <= v <= 16 for v in movement.values()),
+            "Invalid original block movement factors")
+    offset = state.get("offset")
+    require((offset is not None) == state["has_offset"], "Offset descriptor presence mismatch")
+    if offset is not None:
+        require(type(offset) is dict and offset.get("kind") in ("xz", "xyz")
+                and set(offset) == {"kind", "max_horizontal", "max_vertical"}
+                and all(type(offset[k]) in (int, float) and math.isfinite(offset[k]) and 0 <= offset[k] <= 1
+                        for k in ("max_horizontal", "max_vertical")), "Invalid deterministic offset descriptor")
+    require(state.get("collision_context") in ("independent", "vanilla_player_no_fluid_standing"),
+            "Unknown collision context")
+    if state["collision_context"] == "vanilla_player_no_fluid_standing":
+        require(state.get("name") in ("minecraft:water", "minecraft:lava") and state.get("collision") == []
+                and not state.get("collision_offset"), "Fluid player context assigned to incompatible block")
+    for key in ("collision", "outline"):
+        require(key in state and key + "_unresolved" in state, "Missing explicit shape field")
+        boxes, reason = state[key], state[key + "_unresolved"]
+        require(type(state.get(key + "_offset")) is bool
+                and (not state[key + "_offset"] or offset is not None and boxes is not None),
+                "Invalid shape offset flag")
+        require(not state["dynamic"] or offset is not None or boxes is None,
+                "Unresolved dynamic geometry must not become a static box")
+        if boxes is None:
+            require(type(reason) is str and (reason in ("dynamic shape", "position-dependent offset")
+                    or reason.startswith("requires world lookup ")
+                    or reason.startswith("requires player collision context ")),
+                    "Unexpected reference extraction failure")
+        else:
+            require(reason is None, "Invalid resolved shape metadata")
+            validate_boxes(boxes)
+
+
+def validate_boxes(boxes):
+    require(type(boxes) is list and len(boxes) <= 256, "Invalid shape array")
+    for box in boxes:
+        require(type(box) is list and len(box) == 6
+                and all(type(v) in (int, float) and math.isfinite(v) and abs(v) <= 1024 for v in box)
+                and all(box[i] < box[i+3] for i in range(3)), "Invalid shape AABB")
+
+
+def validate_offset_reference(path, catalog_path):
+    require(path.stat().st_size <= 1024 * 1024, "Oversized offset reference")
+    rows = json.loads(path.read_text(encoding="utf8"))
+    require(type(rows) is list and len(rows) == 272, "Incomplete positional reference")
+    catalog = json.loads(catalog_path.read_text(encoding="utf8"))
+    expected = {s["id"]: name for name, block in catalog.items() for s in block["states"]}
+    samples = {}
+    for row in rows:
+        require(type(row) is dict and set(row) == {"id", "name", "position", "offset", "collision", "outline"},
+                "Malformed positional sample")
+        require(type(row["id"]) is int and expected.get(row["id"]) == row["name"], "Positional sample identity mismatch")
+        point, offset = row["position"], row["offset"]
+        require(type(point) is list and len(point) == 3 and all(type(v) is int and abs(v) <= 30_000_000 for v in point),
+                "Invalid reference position")
+        require(type(offset) is list and len(offset) == 3
+                and all(type(v) in (int, float) and math.isfinite(v) and abs(v) <= 1 for v in offset),
+                "Invalid reference offset")
+        positions = samples.setdefault((row["id"], row["name"]), set())
+        require(tuple(point) not in positions, "Duplicate positional sample")
+        positions.add(tuple(point))
+        validate_boxes(row["collision"]); validate_boxes(row["outline"])
+    require(len(samples) == 4 and all(len(points) == 68 for points in samples.values())
+            and {name for _, name in samples} == {"minecraft:dandelion", "minecraft:short_grass", "minecraft:bamboo", "minecraft:pointed_dripstone"},
+            "Incomplete positional block coverage")
+    return len(rows)
+
+
 def validate_report(path, catalog_path):
     require(path.stat().st_size <= 32 * 1024 * 1024, "Oversized shape report")
     report = json.loads(path.read_text(encoding="utf8"))
-    require(report.get("schema_version") == 1 and report.get("minecraft_version") == "1.21.1",
+    require(report.get("schema_version") == 2 and report.get("minecraft_version") == "1.21.1",
             "Unexpected generated shape schema")
     require(report.get("block_catalog_sha256") == CATALOG_SHA256
             and report.get("official_server_sha256") == INNER_SHA256
@@ -125,23 +198,11 @@ def validate_report(path, catalog_path):
     for index, state in enumerate(states):
         require(state.get("id") == index and (state.get("name"), state.get("properties")) == expected[index],
                 "Generated state identity differs from exact catalog")
+        validate_state(state)
         for key in known:
-            require(key in state and key + "_unresolved" in state, "Missing explicit shape field")
-            boxes, reason = state[key], state[key + "_unresolved"]
-            if boxes is None:
-                require(type(reason) is str and (reason in ("dynamic shape", "position-dependent offset")
-                        or reason.startswith("requires world lookup ")
-                        or reason.startswith("requires player collision context ")),
-                        "Unexpected reference extraction failure")
-            else:
-                require(reason is None and type(boxes) is list and len(boxes) <= 4096,
-                        "Invalid resolved shape metadata")
-                for box in boxes:
-                    require(type(box) is list and len(box) == 6
-                            and all(type(v) in (int, float) and math.isfinite(v) for v in box)
-                            and all(box[i] < box[i+3] for i in range(3)), "Invalid shape AABB")
+            if state[key] is not None:
                 known[key] += 1
-    require(known == {"collision": 26473, "outline": 26379}
+    require(known == {"collision": 26537, "outline": 26505}
             and report.get("collision_resolved") == known["collision"]
             and report.get("outline_resolved") == known["outline"],
             "Resolution counts differ from the tested vanilla reference")
@@ -168,18 +229,20 @@ def run(args):
                        timeout=90, check=True, creationflags=flags)
         subprocess.run([args.java, "-Xmx1G", "-cp", str(classes) + os.pathsep + classpath,
                         "leafishreference.ShapeReference", str(mappings), str(catalog), str(inner),
-                        str(output / "shapes-v1.json")], cwd=output, stdin=subprocess.DEVNULL,
+                        str(output / "shapes-v2.json")], cwd=output, stdin=subprocess.DEVNULL,
                        stdout=log, stderr=subprocess.STDOUT, timeout=120, check=True, creationflags=flags)
-    counts = validate_report(output / "shapes-v1.json", catalog)
+    counts = validate_report(output / "shapes-v2.json", catalog)
+    samples = validate_offset_reference(output / "offset-reference.json", catalog)
     for path, expected, label in [(archive, SERVER_SHA256, "Server JAR"),
                                   (mappings, MAPPINGS_SHA256, "Mappings"),
                                   (catalog, CATALOG_SHA256, "Catalog")]:
         require(sha256(path) == expected, label + " changed during generation")
-    summary = {"success": True, "schema_version": 1, "minecraft_version": "1.21.1", "protocol": 767,
+    summary = {"success": True, "schema_version": 2, "minecraft_version": "1.21.1", "protocol": 767,
                "state_count": 26684, "collision_resolved": counts["collision"], "outline_resolved": counts["outline"],
                "bundled_server_sha256": SERVER_SHA256, "inner_server_sha256": INNER_SHA256,
                "server_mappings_sha256": MAPPINGS_SHA256, "block_catalog_sha256": CATALOG_SHA256,
-               "shape_report_sha256": sha256(output / "shapes-v1.json"),
+               "shape_report_sha256": sha256(output / "shapes-v2.json"),
+               "offset_reference_sha256": sha256(output / "offset-reference.json"), "offset_reference_samples": samples,
                "java_generator_sha256": sha256(source), "python_helper_sha256": sha256(Path(__file__)),
                "source_inputs_unchanged": True, "game_server_started": False, "world_loaded": False,
                "generated_data_published": False}

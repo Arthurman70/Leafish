@@ -1,6 +1,7 @@
 pub mod definition;
 pub mod liquid;
 pub mod native_mesh;
+pub mod icons;
 
 use crate::render;
 use crate::resources;

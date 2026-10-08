@@ -201,6 +201,35 @@ pub fn build_section(
     models: &Arc<RwLock<Factory>>,
     tints: &BiomeTints,
 ) -> Result<NativeMesh, String> {
+    build_section_internal(store, section, models, tints, None)
+}
+
+/// Uses the same exact position-dependent offset metadata as collision and
+/// selection. The older entry point remains for callers without shape data.
+pub fn build_section_with_shapes(
+    store: &NativeChunkStore,
+    section: (i32, i32, i32),
+    models: &Arc<RwLock<Factory>>,
+    tints: &BiomeTints,
+    shapes: &crate::modern_shapes::ShapeCatalog,
+) -> Result<NativeMesh, String> {
+    build_section_internal(store, section, models, tints, Some(shapes))
+}
+
+fn build_section_internal(
+    store: &NativeChunkStore,
+    section: (i32, i32, i32),
+    models: &Arc<RwLock<Factory>>,
+    tints: &BiomeTints,
+    shapes: Option<&crate::modern_shapes::ShapeCatalog>,
+) -> Result<NativeMesh, String> {
+    let model_offset = |id, pos| -> Result<[f64; 3], String> {
+        shapes.map_or(Ok([0.0; 3]), |shapes| {
+            shapes
+                .offset_for(id, pos)
+                .map_err(|error| error.to_string())
+        })
+    };
     if tints.biomes.len() != store.context().biome_count as usize {
         return Err("biome tint registry differs from connected world".into());
     }
@@ -248,6 +277,7 @@ pub fn build_section(
                     )?;
                     continue;
                 }
+                let offset = model_offset(state_id, pos)?;
                 if state
                     .properties()
                     .get("waterlogged")
@@ -261,13 +291,13 @@ pub fn build_section(
                     continue;
                 }
                 for (face_index, face) in model.model.model.faces.iter().enumerate() {
-                    if face.cull_face != Direction::Invalid {
+                    if offset == [0.0; 3] && face.cull_face != Direction::Invalid {
                         let (dx, dy, dz) = face.cull_face.get_offset();
                         let neighbor = [pos[0] + dx, pos[1] + dy, pos[2] + dz];
                         if let Some(id) = store.block_state_id(position(neighbor)) {
                             let neighbor_state =
                                 store.catalog().state(id).map_err(|e| e.to_string())?;
-                            if !is_air(neighbor_state) {
+                            if !is_air(neighbor_state) && model_offset(id, neighbor)? == [0.0; 3] {
                                 let other =
                                     prepare(store, neighbor, models, &mut prepared, &mut alphas)?;
                                 if other.opaque_faces & (1 << opposite(face.cull_face).index()) != 0
@@ -283,7 +313,8 @@ pub fn build_section(
                             mesh.missing_tint_states.insert(state_id);
                             [255; 3]
                         });
-                    let (dx, dy, dz) = if face_on_boundary(face, face.facing) {
+                    let (dx, dy, dz) = if offset == [0.0; 3] && face_on_boundary(face, face.facing)
+                    {
                         face.facing.get_offset()
                     } else {
                         (0, 0, 0)
@@ -316,9 +347,9 @@ pub fn build_section(
                     };
                     for vertex in &face.vertices {
                         let mut vertex = vertex.clone();
-                        vertex.x += x as f32;
-                        vertex.y += y as f32;
-                        vertex.z += z as f32;
+                        vertex.x += x as f32 + offset[0] as f32;
+                        vertex.y += y as f32 + offset[1] as f32;
+                        vertex.z += z as f32 + offset[2] as f32;
                         vertex.r = (color[0] as f32 * shade) as u8;
                         vertex.g = (color[1] as f32 * shade) as u8;
                         vertex.b = (color[2] as f32 * shade) as u8;
@@ -1201,6 +1232,75 @@ mod tests {
         assert_eq!(models.read().native_texture_alpha.len(), 2);
         models.write().version_change();
         assert!(models.read().native_texture_alpha.is_empty());
+    }
+
+    #[test]
+    fn rendered_position_offsets_match_selection_boxes_and_disable_full_face_culling() {
+        let (mut store, models, tints) = fixture();
+        let hash = "a".repeat(64);
+        let states: Vec<_> = store.catalog().states().iter().map(|state| {
+            let shifted = state.id() == 1;
+            serde_json::json!({
+                "id":state.id(),"name":state.name(),"properties":state.properties(),
+                "dynamic":shifted,"has_offset":shifted,
+                "collision":if shifted {vec![[0.,0.,0.,1.,1.,1.]]} else {vec![]},
+                "outline":if shifted {vec![[0.,0.,0.,1.,1.,1.]]} else {vec![]},
+                "collision_offset":shifted,"outline_offset":shifted,
+                "collision_context":"independent",
+                "offset":if shifted {serde_json::json!({"kind":"xyz","max_horizontal":0.25,"max_vertical":0.2})} else {serde_json::Value::Null},
+                "movement":{"friction":0.6,"speed_factor":1.0,"jump_factor":1.0}
+            })
+        }).collect();
+        let report = serde_json::json!({"schema_version":2,"minecraft_version":"1.21.1","block_catalog_sha256":hash,"states":states});
+        let shapes = crate::modern_shapes::ShapeCatalog::from_json(
+            &serde_json::to_vec(&report).unwrap(),
+            store.catalog(),
+            &hash,
+        )
+        .unwrap();
+        let pos = [-15, -15, 33];
+        store
+            .apply_block_updates(&[
+                BlockUpdate {
+                    position: pos,
+                    state_id: 1,
+                },
+                BlockUpdate {
+                    position: [-14, -15, 33],
+                    state_id: 1,
+                },
+            ])
+            .unwrap();
+        let mesh =
+            build_section_with_shapes(&store, (-1, -1, 2), &models, &tints, &shapes).unwrap();
+        assert_eq!((mesh.solid_count, mesh.trans_count), (72, 0));
+        let bounds = shapes.outline_at(1, pos).unwrap()[0];
+        assert_ne!(shapes.offset_for(1, pos).unwrap(), [0.0; 3]);
+        for axis in 0..3 {
+            let coordinates: Vec<_> = mesh
+                .solid_buffer
+                .chunks_exact(40)
+                .take(24)
+                .map(|v| {
+                    let i = axis * 4;
+                    f32::from_ne_bytes([v[i], v[i + 1], v[i + 2], v[i + 3]]) as f64
+                })
+                .collect();
+            let min = coordinates.iter().copied().fold(f64::INFINITY, f64::min);
+            let max = coordinates
+                .iter()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!((min - (1.0 + bounds.min[axis])).abs() < 1e-6);
+            assert!((max - (1.0 + bounds.max[axis])).abs() < 1e-6);
+        }
+        // The compatibility entry point retains its original unshifted behavior.
+        assert_eq!(
+            build_section(&store, (-1, -1, 2), &models, &tints)
+                .unwrap()
+                .solid_count,
+            60
+        );
     }
 
     #[test]
