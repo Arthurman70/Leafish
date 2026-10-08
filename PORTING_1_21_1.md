@@ -16,6 +16,7 @@ support. This fork is not a dedicated-server implementation.
 | Signed dimension heights | Validated immutable world bounds, dynamic sections, signed heightmaps, snapshot and dirty-region tests; the 20 legacy chunk fixtures still pass | CPU storage supports negative/tall dimensions; cloud texture remains a legacy 8-bit projection and full modern rendering/collision remains pending |
 | Exact runtime identities and world storage | Caller-supplied state catalog with checked forward/reverse lookup; native chunk store retains raw states, quart biomes, NBT and merged light, with atomic update validation and retention bounds | Separate from the legacy block enum; no unknown state becomes air. Material, collision, light emission and behavior metadata are still required |
 | Native runtime adapter | Synthetic TCP tests cover configuration, movement, relative teleport generations, authoritative block changes, action acknowledgments, abilities, FIFO completion and consumer closure | Loopback vanilla reference only; authentication, mods, respawn and reconfiguration remain unsupported. Movement/action encoding is not gameplay parity |
+| Actual client adapter-to-store run | The client binary's native check retained 45 chunks / 1,080 sections and matched 4,423,680 block values plus 69,120 biome values to the independently decoded saved world | One movement echo and abilities were observed; this run contained no block updates, separate light updates or block entities. Those paths have synthetic tests, not live parity evidence |
 | Local assets and model definitions | Read-only client/resource ZIP mounting, version-correct object-index paths; model tests cover property subsets, exact alternatives, AND/OR, namespaces, parent replacement and texture aliases | Custom model loaders fail explicitly; empty geometry is reported separately, not treated as a successfully rendered entity |
 | Build and public tests | 55 protocol tests and 50 client tests passed locally; private configuration/model tests are ignored by default | Compilation and tests do not establish 1.21.1 GUI behavior; the separate legacy mining failure remains below |
 
@@ -104,6 +105,15 @@ below accepts this report as well as the protocol-only probe's report.
 
 This mode rejects non-loopback destinations before connecting and uses no account
 credentials. It does not enter the unfinished graphical gameplay path.
+
+The local run passed against the separate vanilla reference server, using the
+actual client executable rather than the protocol example. It retained 45
+chunks, confirmed one teleport, sent one movement echo, received player
+abilities, acknowledged 19 batches and answered two keepalives. The native
+store's complete block/biome fingerprints matched the saved world after clean
+server shutdown. The run took about 30.5 seconds while waiting for keepalives;
+it is not a performance measurement. Unsupported packets are listed in the
+private report, not silently described as implemented.
 
 ## Local assets and isolated profiles
 
