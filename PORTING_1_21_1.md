@@ -5,6 +5,64 @@ protocol 767. The intended modded integration target is NeoForge 21.1.236 with
 Create 6.0.10. Those targets describe future compatibility work, not current
 support. This fork is not a dedicated-server implementation.
 
+The explicit `--local-world` path now supports an early, local Creative session
+against a separate **official vanilla Java 1.21.1 server**. It renders real
+received terrain using supplied 1.21.1 models/textures, moves and collides,
+and sends Creative block selection, breaking and placement to the server. It
+skips account loading and the login screen. This is not complete Minecraft,
+survival, NeoForge/Create compatibility, or a Rust server, and no performance
+gain has been established.
+
+## Local Creative play
+
+Use your own vanilla 1.21.1 server, bound to `127.0.0.1`, with a **separate new
+world**, `online-mode=false`, `gamemode=creative`, `force-gamemode=true`,
+`allow-flight=true`, `view-distance=2`, and `simulation-distance=2`. This path
+rejects non-loopback servers and does not bypass authentication on a normal
+server. For this milestone use peaceful daytime and disable mob spawning;
+entity rendering, weather, survival and dimension changes are unfinished.
+
+Generate exact block/item reports with `tools/generate_vanilla_reference.py`
+and the collision/outline report using
+[the source-only shape exporter](tools/SHAPE_REFERENCE.md). Generated reports,
+assets and game archives are local inputs, not distributed with this fork.
+
+```text
+leafish --local-world 127.0.0.1:25587 --profile-dir /path/to/new-profile --client-jar /path/to/client-1.21.1.jar --assets-dir /path/to/assets --asset-index 17 --block-catalog /path/to/blocks.json --item-registry /path/to/registries.json --shape-catalog /path/to/shapes-v1.json
+```
+
+Controls: WASD movement, mouse look, Space/Shift flight, Ctrl faster flight,
+left/right click break/place, 1–9 or wheel hotbar, E searchable block picker,
+arrows/Enter picker selection, Escape releases/resumes controls, F11 fullscreen.
+Closing the client disconnects it; your server launcher is responsible for a
+clean world save and shutdown. The block picker is an early text UI; item model
+icons and the complete inventory are not implemented.
+
+The graphical checks used the actual Windows client executable and a separate
+vanilla server. A normal-terrain run received 45 chunks and rendered 390 section
+meshes. A separate controlled run moved horizontally/upward, broke a block and
+placed oak planks through server-authoritative updates and acknowledgments.
+Independent decoding of the stopped server's save confirmed the final block,
+player position, Creative flight and selected slot. These bounded checks do not
+establish full gameplay parity.
+
+`--capture-frame /path/to/new.png` exports the client's own rendered world after
+initial meshing, then exits. Adding `--verify-local-play` enables a bounded
+movement/break/place diagnostic that **changes that disposable world**; never
+use it on a world you care about. Its JSON report distinguishes unsupported
+visual states and does not claim complete parity. Keep captures and reports
+private because they include installed artwork and world content.
+
+Current boundaries: static shapes are exported from the official runtime and
+bound to the exact state catalog. Dynamic, offset or context-dependent shapes
+remain unresolved and stop affected collision/targeting explicitly. Survival
+physics, stepping, fluid motion, entities/block-entity visuals, complete item
+components/inventories/crafting, sound, dimension changes, remote authentication,
+NeoForge and mods remain unfinished. Fluids and biome tinting have a native
+rendering path, but partial/waterlogged boundaries, blending, ambient occlusion
+and some biome color modifiers are incomplete. The normal legacy server-browser
+path still excludes protocol 767; use this explicit local Creative path only.
+
 ## Verified components
 
 | Component | Evidence | Boundary |
@@ -19,7 +77,9 @@ support. This fork is not a dedicated-server implementation.
 | Actual client adapter-to-store run | The client binary's native check retained 45 chunks / 1,080 sections and matched 4,423,680 block values plus 69,120 biome values to the independently decoded saved world | One movement echo and abilities were observed; this run contained no block updates, separate light updates or block entities. Those paths have synthetic tests, not live parity evidence |
 | Local assets and model definitions | Read-only client/resource ZIP mounting, version-correct object-index paths; model tests cover property subsets, exact alternatives, AND/OR, namespaces, parent replacement and texture aliases | Custom model loaders fail explicitly; empty geometry is reported separately, not treated as a successfully rendered entity |
 | Modern menu widgets | Buttons and sliders use the installed split sprites and their stretch, tile or nine-slice metadata; five synthetic tests and an optional check of all seven installed sprite states pass | Startup rendering is verified separately; this does not establish world rendering or gameplay |
-| Build and public tests | 55 protocol tests and 55 client tests passed locally; private configuration/model/widget tests are ignored by default | Compilation and tests do not establish 1.21.1 gameplay; the separate legacy mining failure remains below |
+| Native Creative GUI | Modern store to terrain meshing, exact artwork, biome colors, fluids, modern hotbar and searchable block selection; live normal terrain and confirmed block edits | Early local Creative scope above; no full-game or mod parity |
+| Collision and targeting | Exact 26,684-state identity match; 26,473 collision shapes and 26,379 outline shapes resolved from the official runtime; ray and player collision tests | Unresolved contextual shapes are explicit errors; no substitute cubes or air |
+| Build and public tests | 58 protocol and 81 client tests passed; private reference tests are ignored by default | Compilation and unit tests do not establish complete gameplay; the separate legacy mining failure remains below |
 
 The live run received no block entities. Its light-array count demonstrates
 decoding and retention, not an independent check of lighting values or rendered
@@ -39,10 +99,11 @@ The packet and section layouts were checked against locally supplied Minecraft
 ## Pending work
 
 The isolated Play session and independent saved-world comparison have passed.
-The client now includes the modern adapter and exact native world store. The
-graphical client still uses its legacy block representation and connection path;
-connecting the new store to rendering, collision, inventories and interaction
-remains a separate milestone. A model's shape alone does not define those rules.
+The client includes the modern adapter and exact native world store. The normal
+server browser still uses its legacy path; the explicit local Creative path
+connects the modern store to rendering, static collision, basic inventory
+selection and block interaction. Complete behavior remains unfinished. A
+rendered model alone does not define a block's rules.
 
 Further work includes applying negotiated registries and dimension properties
 throughout the client, complete chunk/light and block-entity behavior, modern
@@ -52,10 +113,10 @@ NeoForge negotiation and each required mod's behavior need their own
 implementation and tests. Preserving an
 unknown ID or custom payload does not make that content functional.
 
-There is currently no verified NeoForge/Create parity, 1.21.1 GUI compatibility,
+There is currently no verified NeoForge/Create parity, complete 1.21.1 gameplay,
 Rust server port, shader/ray-tracing upgrade, or measured performance gain.
-Protocol 767 remains outside the normal supported-gameplay list until the
-integration is demonstrated. Changes to that claim require reproducible results.
+Protocol 767 remains outside the normal server-browser list. Local Creative
+support is limited to the explicit path and evidence above.
 
 ## Build and public tests
 
@@ -77,11 +138,12 @@ cargo build --locked --release
 ```
 
 The protocol tests do not require a Minecraft installation or Java. The build
-command builds Leafish; it does not enable 1.21.1 gameplay. Existing legacy
+command builds Leafish; local 1.21.1 play needs the explicit inputs above. Legacy
 client behavior and tests remain relevant during the port.
 
-The verified public protocol result is 55 passed and one private-fixture test
-ignored. That optional private configuration test also passed when explicitly
+The verified public protocol result is 58 passed and one private-fixture test
+ignored; the client result is 81 passed and two private tests ignored. That
+optional private configuration test also passed when explicitly
 run locally; it is not included in the public count. The separate legacy
 block-test failure is documented below; the complete client's test suite is
 not reported as passing.
@@ -113,9 +175,9 @@ For the optional installed-widget reference test, set
 cargo test --locked -p leafish --bin leafish ui::sprites::tests::installed_widget_art_and_metadata_cover_each_state -- --ignored
 ```
 
-These checks establish menu artwork and startup rendering only. The startup
-background is an image; it is not a rendered 1.21.1 world. Modern gameplay and
-the user's modpack remain unsupported.
+These menu checks establish artwork and startup rendering only. The menu
+background is an image; it is not a rendered world. The separate local Creative
+world-rendering checks are described above. The modpack remains unsupported.
 
 ## Native client world verification
 
@@ -136,7 +198,7 @@ the actual native store. After a clean server shutdown, the saved-world verifier
 below accepts this report as well as the protocol-only probe's report.
 
 This mode rejects non-loopback destinations before connecting and uses no account
-credentials. It does not enter the unfinished graphical gameplay path.
+credentials. It does not enter the graphical local Creative path.
 
 The local run passed against the separate vanilla reference server, using the
 actual client executable rather than the protocol example. It retained 45

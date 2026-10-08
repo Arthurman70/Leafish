@@ -359,9 +359,61 @@ impl Renderer {
         physical_width: u32,
         physical_height: u32,
     ) {
+        let render_list = world
+            .as_ref()
+            .map_or_else(Vec::new, |world| world.get_render_list());
+        self.tick_scene(
+            world.as_deref(),
+            world.is_some(),
+            &render_list,
+            delta,
+            width,
+            height,
+            physical_width,
+            physical_height,
+        );
+    }
+
+    /// Draw exact native section meshes using the existing texture/shader path.
+    /// The caller updates the camera and owns section visibility and ordering.
+    /// Legacy entity models and cloud heightmaps are not part of this scene.
+    #[allow(clippy::type_complexity)]
+    pub fn tick_native(
+        &self,
+        render_list: &[((i32, i32, i32), Arc<RwLock<ChunkBuffer>>)],
+        delta: f64,
+        width: u32,
+        height: u32,
+        physical_width: u32,
+        physical_height: u32,
+    ) {
+        self.tick_scene(
+            None,
+            true,
+            render_list,
+            delta,
+            width,
+            height,
+            physical_width,
+            physical_height,
+        );
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn tick_scene(
+        &self,
+        world: Option<&World>,
+        scene_active: bool,
+        render_list: &[((i32, i32, i32), Arc<RwLock<ChunkBuffer>>)],
+        delta: f64,
+        width: u32,
+        height: u32,
+        physical_width: u32,
+        physical_height: u32,
+    ) {
         self.update_textures(delta);
 
-        if world.is_some() {
+        if scene_active {
             if self.chunk_render_data.lock().trans.is_some() {
                 let chunk_data = self.chunk_render_data.lock();
                 let trans = chunk_data.trans.as_ref().unwrap();
@@ -417,9 +469,7 @@ impl Renderer {
                 .sky_offset
                 .set_float(self.light_data.lock().sky_offset);
 
-            let tmp_world = world.as_ref().unwrap().clone();
-
-            for (pos, info) in tmp_world.get_render_list() {
+            for (pos, info) in render_list {
                 if let Some(solid) = info.clone().read().solid.as_ref() {
                     if solid.count > 0 {
                         self.chunk_render_data.lock().chunk_shader.offset.set_int3(
@@ -441,27 +491,27 @@ impl Renderer {
             // Line rendering
             // Model rendering
             let light_data = self.light_data.lock();
-            self.models.lock().draw(
-                *self.frustum.lock(), /*&self.frustum*/
-                &self.perspective_matrix.lock(),
-                &self.camera_matrix.lock(),
-                light_data.light_level,
-                light_data.sky_offset,
-            );
-            let tmp_world = world.as_ref().unwrap().clone();
-
-            if let Some(clouds) = &mut *self.clouds.lock() {
-                if tmp_world.copy_cloud_heightmap(&mut clouds.heightmap_data) {
-                    clouds.dirty = true;
-                }
-                clouds.draw(
-                    &self.camera.lock().pos,
+            if let Some(world) = world {
+                self.models.lock().draw(
+                    *self.frustum.lock(), /*&self.frustum*/
                     &self.perspective_matrix.lock(),
                     &self.camera_matrix.lock(),
                     light_data.light_level,
                     light_data.sky_offset,
-                    delta,
                 );
+                if let Some(clouds) = &mut *self.clouds.lock() {
+                    if world.copy_cloud_heightmap(&mut clouds.heightmap_data) {
+                        clouds.dirty = true;
+                    }
+                    clouds.draw(
+                        &self.camera.lock().pos,
+                        &self.perspective_matrix.lock(),
+                        &self.camera_matrix.lock(),
+                        light_data.light_level,
+                        light_data.sky_offset,
+                        delta,
+                    );
+                }
             }
 
             if self.chunk_render_data.lock().trans.is_some() {
@@ -519,7 +569,7 @@ impl Renderer {
 
         gl::enable(gl::BLEND);
         gl::depth_mask(false);
-        if world.is_some() && self.chunk_render_data.lock().trans.is_some() {
+        if scene_active && self.chunk_render_data.lock().trans.is_some() {
             let chunk_data = self.chunk_render_data.lock();
             let trans = chunk_data.trans.as_ref().unwrap();
             trans.trans.bind();
@@ -535,9 +585,8 @@ impl Renderer {
             gl::ONE_MINUS_SRC_ALPHA,
         );
 
-        if world.is_some() {
-            let tmp_world = world.as_ref().unwrap().clone();
-            for (pos, info) in tmp_world.get_render_list().iter().rev() {
+        if scene_active {
+            for (pos, info) in render_list.iter().rev() {
                 if let Some(trans) = info.clone().read().trans.as_ref() {
                     if trans.count > 0 {
                         self.chunk_render_data
@@ -562,7 +611,7 @@ impl Renderer {
         gl::disable(gl::DEPTH_TEST);
         gl::clear(gl::ClearFlags::Color);
         gl::disable(gl::BLEND);
-        if world.is_some() && self.chunk_render_data.lock().trans.is_some() {
+        if scene_active && self.chunk_render_data.lock().trans.is_some() {
             let mut chunk_data = self.chunk_render_data.lock();
             let shader = chunk_data.trans_shader.clone();
             let trans = chunk_data.trans.as_mut().unwrap();
@@ -1185,7 +1234,7 @@ pub struct TextureManager {
 impl TextureManager {
     #[allow(clippy::let_and_return)]
     #[allow(clippy::type_complexity)]
-    fn new(
+    pub(crate) fn new(
         res: Arc<RwLock<resources::Manager>>,
     ) -> (
         TextureManager,

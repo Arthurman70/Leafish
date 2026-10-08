@@ -1,5 +1,6 @@
 pub mod definition;
 pub mod liquid;
+pub mod native_mesh;
 
 use crate::render;
 use crate::resources;
@@ -26,6 +27,7 @@ pub struct Factory {
     pub textures: Arc<RwLock<render::TextureManager>>,
 
     models: HashMap<Key, StateModel, BuildHasherDefault<FNVHash>>,
+    native_texture_alpha: HashMap<String, native_mesh::Alpha>,
 
     grass_colors: image::DynamicImage,
     foliage_colors: image::DynamicImage,
@@ -83,6 +85,7 @@ impl Factory {
             textures,
 
             models: HashMap::with_hasher(BuildHasherDefault::default()),
+            native_texture_alpha: HashMap::new(),
         }
     }
 
@@ -101,6 +104,7 @@ impl Factory {
 
     pub fn version_change(&mut self) {
         self.models.clear();
+        self.native_texture_alpha.clear();
         self.grass_colors = Factory::load_biome_colors(self.resources.clone(), "grass");
         self.foliage_colors = Factory::load_biome_colors(self.resources.clone(), "foliage");
     }

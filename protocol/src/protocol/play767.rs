@@ -20,6 +20,7 @@ pub const MAX_RETAINED_BYTES: usize = 64 * 1024 * 1024;
 #[derive(Debug, PartialEq, Eq)]
 pub enum PlayError {
     Invalid(&'static str),
+    Unsupported(&'static str),
     Truncated,
     Limit(&'static str),
     Trailing(usize),
@@ -247,6 +248,31 @@ pub struct BlockUpdate {
     pub state_id: u32,
 }
 
+/// Numeric item registry ID, not a block-state ID. Only an empty component
+/// patch is decoded here; defaults belong to the negotiated item definition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlainItemStack {
+    pub item_id: u32,
+    pub count: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventoryContent {
+    pub container_id: u8,
+    pub state_id: u32,
+    pub slots: Vec<Option<PlainItemStack>>,
+    pub carried: Option<PlainItemStack>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InventorySlot {
+    /// -1 is the carried stack; -2 uses player-inventory indices directly.
+    pub container_id: i8,
+    pub state_id: u32,
+    pub slot: i16,
+    pub item: Option<PlainItemStack>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clientbound {
     BundleDelimiter,
@@ -269,6 +295,15 @@ pub enum Clientbound {
     Abilities(PlayerAbilities),
     BlockUpdates(Vec<BlockUpdate>),
     BlockActionAcknowledged(i32),
+    InventoryContent(InventoryContent),
+    InventorySlot(InventorySlot),
+    SelectedSlot(u8),
+    /// Component payloads are not length-prefixed. Preserve the entire bounded
+    /// packet instead of guessing boundaries or silently clearing inventory.
+    UnsupportedInventory {
+        packet_id: i32,
+        data: Vec<u8>,
+    },
     CustomPayload {
         id: String,
         data: Vec<u8>,
@@ -288,6 +323,17 @@ pub fn decode_clientbound767(
     context: Option<&WorldContext>,
 ) -> Result<Clientbound> {
     let mut r = Reader::new(payload)?;
+    if id == 0x13 || id == 0x15 {
+        return match read_inventory(id, &mut r) {
+            Err(PlayError::Unsupported("item components")) => {
+                Ok(Clientbound::UnsupportedInventory {
+                    packet_id: id,
+                    data: payload.to_vec(),
+                })
+            }
+            result => result,
+        };
+    }
     let packet = match id {
         0x00 => Clientbound::BundleDelimiter,
         0x05 => Clientbound::BlockActionAcknowledged(r.nonnegative()? as i32),
@@ -441,6 +487,13 @@ pub fn decode_clientbound767(
             }
             Clientbound::BlockUpdates(updates)
         }
+        0x53 => {
+            let slot = r.u8()?;
+            if slot > 8 {
+                return Err(PlayError::Invalid("selected hotbar slot"));
+            }
+            Clientbound::SelectedSlot(slot)
+        }
         0x69 => Clientbound::StartConfiguration,
         id if id >= 0 => Clientbound::Unhandled {
             packet_id: id,
@@ -450,6 +503,49 @@ pub fn decode_clientbound767(
     };
     r.finish()?;
     Ok(packet)
+}
+
+// ClientboundContainerSetContentPacket/SetSlotPacket and ItemStack's
+// OPTIONAL_STREAM_CODEC in 1.21.1. Registry holder IDs have no +1 offset here.
+fn read_inventory(id: i32, r: &mut Reader<'_>) -> Result<Clientbound> {
+    let container = r.u8()?;
+    let state_id = r.nonnegative()?;
+    let packet = if id == 0x13 {
+        let count = r.count(1024, "inventory slots")?;
+        let mut slots = Vec::with_capacity(count);
+        for _ in 0..count {
+            slots.push(read_plain_stack(r)?);
+        }
+        Clientbound::InventoryContent(InventoryContent {
+            container_id: container,
+            state_id,
+            slots,
+            carried: read_plain_stack(r)?,
+        })
+    } else {
+        Clientbound::InventorySlot(InventorySlot {
+            container_id: container as i8,
+            state_id,
+            slot: r.i16()?,
+            item: read_plain_stack(r)?,
+        })
+    };
+    r.finish()?;
+    Ok(packet)
+}
+
+fn read_plain_stack(r: &mut Reader<'_>) -> Result<Option<PlainItemStack>> {
+    let count = r.nonnegative()?;
+    if count == 0 {
+        return Ok(None);
+    }
+    let item_id = r.nonnegative()?;
+    let added = r.count(256, "item component additions")?;
+    let removed = r.count(256, "item component removals")?;
+    if added != 0 || removed != 0 {
+        return Err(PlayError::Unsupported("item components"));
+    }
+    Ok(Some(PlainItemStack { item_id, count }))
 }
 
 fn unpack_block_position(value: i64) -> [i32; 3] {
@@ -608,6 +704,12 @@ pub enum Serverbound {
         hand: u8,
     },
     SelectedSlot(u8),
+    /// Inventory-menu slot 1..45, or -1 to drop. The interactive adapter only
+    /// exposes hotbar slots 36..44 and fresh items with empty component patches.
+    CreativeSlot {
+        slot: i16,
+        item: Option<PlainItemStack>,
+    },
     /// Sequence allocation and acknowledgment tracking belong to the runtime.
     PlayerAction {
         action: u8,
@@ -682,6 +784,23 @@ pub fn encode_serverbound767(packet: &Serverbound) -> Result<(i32, Vec<u8>)> {
             }
             out.extend_from_slice(&(*slot as i16).to_be_bytes());
             0x2f
+        }
+        Serverbound::CreativeSlot { slot, item } => {
+            if *slot != -1 && !(1..=45).contains(slot) {
+                return Err(PlayError::Invalid("creative inventory slot"));
+            }
+            out.extend_from_slice(&slot.to_be_bytes());
+            if let Some(item) = item {
+                if item.count == 0 || item.count > 64 || item.item_id > i32::MAX as u32 {
+                    return Err(PlayError::Invalid("plain creative stack"));
+                }
+                push_varint(&mut out, item.count as i32);
+                push_varint(&mut out, item.item_id as i32);
+                out.extend_from_slice(&[0, 0]);
+            } else {
+                out.push(0);
+            }
+            0x32
         }
         Serverbound::PlayerAction {
             action,
@@ -918,7 +1037,13 @@ impl PlaySession {
             // mutation is applied to the retained wire-chunk snapshots here.
             Clientbound::Abilities(_)
             | Clientbound::BlockUpdates(_)
-            | Clientbound::BlockActionAcknowledged(_) => {}
+            | Clientbound::BlockActionAcknowledged(_)
+            | Clientbound::InventoryContent(_)
+            | Clientbound::InventorySlot(_)
+            | Clientbound::SelectedSlot(_) => {}
+            Clientbound::UnsupportedInventory { packet_id, .. } => {
+                *self.unhandled_packets.entry(packet_id).or_default() += 1;
+            }
             Clientbound::BatchStart => {
                 if self.join.is_none() || self.current_batch.is_some() {
                     return Err(PlayError::Invalid("chunk batch start order"));
@@ -1210,6 +1335,111 @@ fn push_varint(out: &mut Vec<u8>, value: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn creative_stack_and_inventory_fields_follow_1211_stream_codecs() {
+        let item = PlainItemStack {
+            item_id: 300,
+            count: 64,
+        };
+        // SHORT slot, VAR_INT count, unshifted registry holder ID, two empty patch counts.
+        assert_eq!(
+            encode_serverbound767(&Serverbound::CreativeSlot {
+                slot: 36,
+                item: Some(item.clone()),
+            })
+            .unwrap(),
+            (0x32, vec![0, 36, 64, 0xac, 2, 0, 0])
+        );
+        assert_eq!(
+            encode_serverbound767(&Serverbound::CreativeSlot {
+                slot: 44,
+                item: None,
+            })
+            .unwrap(),
+            (0x32, vec![0, 44, 0])
+        );
+        let content = vec![0, 0x81, 1, 2, 0, 64, 0xac, 2, 0, 0, 0];
+        assert_eq!(
+            decode_clientbound767(0x13, &content, None).unwrap(),
+            Clientbound::InventoryContent(InventoryContent {
+                container_id: 0,
+                state_id: 129,
+                slots: vec![None, Some(item.clone())],
+                carried: None,
+            })
+        );
+        assert_eq!(
+            decode_clientbound767(0x15, &[0xfe, 0, 0, 8, 64, 0xac, 2, 0, 0], None).unwrap(),
+            Clientbound::InventorySlot(InventorySlot {
+                container_id: -2,
+                state_id: 0,
+                slot: 8,
+                item: Some(item),
+            })
+        );
+        assert_eq!(
+            decode_clientbound767(0x15, &[0xff, 0, 0xff, 0xff, 0], None).unwrap(),
+            Clientbound::InventorySlot(InventorySlot {
+                container_id: -1,
+                state_id: 0,
+                slot: -1,
+                item: None,
+            })
+        );
+        assert_eq!(
+            decode_clientbound767(0x53, &[8], None).unwrap(),
+            Clientbound::SelectedSlot(8)
+        );
+    }
+
+    #[test]
+    fn unknown_item_components_preserve_whole_packet_without_partial_inventory() {
+        // One empty slot, then a stack whose addition has an opaque component body.
+        let body = vec![0, 0, 2, 0, 1, 1, 1, 0, 42, 99, 88];
+        assert_eq!(
+            decode_clientbound767(0x13, &body, None).unwrap(),
+            Clientbound::UnsupportedInventory {
+                packet_id: 0x13,
+                data: body
+            }
+        );
+        let removal = vec![0, 0, 0, 36, 1, 1, 0, 1, 42];
+        assert_eq!(
+            decode_clientbound767(0x15, &removal, None).unwrap(),
+            Clientbound::UnsupportedInventory {
+                packet_id: 0x15,
+                data: removal
+            }
+        );
+        // This is deliberately not a claim that an unsupported component is valid.
+        // Its raw packet stays bounded and must not become a trusted empty stack.
+    }
+
+    #[test]
+    fn inventory_limits_truncation_and_invalid_creative_requests_are_rejected() {
+        let packet = [0, 0, 0, 36, 1, 1, 0, 0];
+        for end in 0..packet.len() {
+            assert!(decode_clientbound767(0x15, &packet[..end], None).is_err());
+        }
+        let mut trailing = packet.to_vec();
+        trailing.push(0);
+        assert!(decode_clientbound767(0x15, &trailing, None).is_err());
+        assert!(decode_clientbound767(0x13, &[0, 0, 0x81, 8], None).is_err());
+        assert!(decode_clientbound767(0x53, &[9], None).is_err());
+        for slot in [-2, 0, 46, i16::MAX] {
+            assert!(
+                encode_serverbound767(&Serverbound::CreativeSlot { slot, item: None }).is_err()
+            );
+        }
+        for (item_id, count) in [(1, 0), (1, 65), (u32::MAX, 1)] {
+            assert!(encode_serverbound767(&Serverbound::CreativeSlot {
+                slot: 36,
+                item: Some(PlainItemStack { item_id, count }),
+            })
+            .is_err());
+        }
+    }
+
     #[test]
     fn modern_movement_and_action_wire_fields_are_exact() {
         assert_eq!(

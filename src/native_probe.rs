@@ -90,6 +90,10 @@ pub fn run(address: SocketAddr, catalog_path: &Path) -> Result<Value, Box<dyn Er
                     }
                     ModernEvent::Abilities(_) => abilities_seen = true,
                     ModernEvent::BlockActionAcknowledged(_) => {}
+                    ModernEvent::InventoryContent(_)
+                    | ModernEvent::InventorySlot(_)
+                    | ModernEvent::SelectedSlot(_)
+                    | ModernEvent::UnsupportedInventory { .. } => {}
                     ModernEvent::ConformanceCheckpoint { stats } => checkpoint = Some(stats),
                 }
             }

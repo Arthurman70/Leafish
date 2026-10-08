@@ -60,6 +60,14 @@ pub enum ModernEvent {
     BlockChanges(Vec<play::BlockUpdate>),
     Abilities(play::PlayerAbilities),
     BlockActionAcknowledged(i32),
+    InventoryContent(play::InventoryContent),
+    InventorySlot(play::InventorySlot),
+    SelectedSlot(u8),
+    /// Preserved without applying a partial inventory update or inventing items.
+    UnsupportedInventory {
+        packet_id: i32,
+        data: Vec<u8>,
+    },
     /// An ordered cut after complete batches/bundles and all earlier typed
     /// events. Emitted once; polling asynchronous counters is not conformance.
     ConformanceCheckpoint {
@@ -103,12 +111,15 @@ impl Actions {
 
 struct Shared {
     biome_names: Vec<String>,
+    biome_entries: Vec<config::RegistryEntry>,
+    item_names: Option<Arc<Vec<String>>>,
     registry_counts: BTreeMap<String, usize>,
     writer: Mutex<wire::Framed<TcpStream>>,
     shutdown: TcpStream,
     closed: AtomicBool,
     queued_bytes: AtomicUsize,
     player: Mutex<Option<LocalTransform>>,
+    abilities: Mutex<Option<play::PlayerAbilities>>,
     actions: Mutex<Actions>,
     stats: Mutex<RuntimeStats>,
 }
@@ -178,6 +189,27 @@ impl ModernConnection {
         address: SocketAddr,
         username: &str,
         catalog: Arc<StateCatalog>,
+    ) -> Result<(Arc<Self>, ModernEvents)> {
+        Self::connect_inner(address, username, catalog, None)
+    }
+
+    /// Item names must be the exact dense wire-ID order from the same vanilla
+    /// version's generated minecraft:item registry, not the block-state catalog.
+    pub fn connect_loopback_with_items(
+        address: SocketAddr,
+        username: &str,
+        catalog: Arc<StateCatalog>,
+        item_names: Arc<Vec<String>>,
+    ) -> Result<(Arc<Self>, ModernEvents)> {
+        validate_item_names(&item_names)?;
+        Self::connect_inner(address, username, catalog, Some(item_names))
+    }
+
+    fn connect_inner(
+        address: SocketAddr,
+        username: &str,
+        catalog: Arc<StateCatalog>,
+        item_names: Option<Arc<Vec<String>>>,
     ) -> Result<(Arc<Self>, ModernEvents)> {
         if !address.ip().is_loopback() {
             return Err(invalid("Experimental runtime accepts loopback only"));
@@ -266,12 +298,11 @@ impl ModernConnection {
             .get("minecraft:dimension_type")
             .ok_or_else(|| invalid("Missing dimension registry"))?
             .clone();
-        let biome_names: Vec<String> = registries
+        let biome_entries = registries
             .get("minecraft:worldgen/biome")
             .ok_or_else(|| invalid("Missing biome registry"))?
-            .iter()
-            .map(|entry| entry.id.clone())
-            .collect();
+            .clone();
+        let biome_names: Vec<String> = biome_entries.iter().map(|entry| entry.id.clone()).collect();
         let biomes = biome_names.len();
         let session =
             play::PlaySession::new(dimensions, count as u32, biomes as u32).map_err(protocol)?;
@@ -284,12 +315,15 @@ impl ModernConnection {
         }
         let shared = Arc::new(Shared {
             biome_names,
+            biome_entries,
+            item_names,
             registry_counts,
             writer: Mutex::new(writer),
             shutdown,
             closed: AtomicBool::new(false),
             queued_bytes: AtomicUsize::new(0),
             player: Mutex::new(None),
+            abilities: Mutex::new(None),
             actions: Mutex::new(Actions {
                 next: 1,
                 acknowledged: 0,
@@ -333,6 +367,12 @@ impl ModernConnection {
     pub fn biome_registry_names(&self) -> &[String] {
         &self.shared.biome_names
     }
+    pub fn biome_registry_entries(&self) -> &[config::RegistryEntry] {
+        &self.shared.biome_entries
+    }
+    pub fn item_registry_names(&self) -> Option<&[String]> {
+        self.shared.item_names.as_ref().map(|v| v.as_slice())
+    }
     pub fn registry_counts(&self) -> &BTreeMap<String, usize> {
         &self.shared.registry_counts
     }
@@ -362,6 +402,17 @@ impl ModernConnection {
     /// Only stateless UI commands use this path. Movement has a teleport generation;
     /// actions allocate tracked sequences. Server-control replies remain internal.
     pub fn send(&self, packet: play::Serverbound) -> Result<()> {
+        if matches!(packet, play::Serverbound::Flying(true))
+            && !self
+                .shared
+                .abilities
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(false, |v| v.may_fly)
+        {
+            return Err(invalid("Server has not granted flight"));
+        }
         match packet {
             play::Serverbound::Flying(_)
             | play::Serverbound::PlayerCommand { .. }
@@ -376,6 +427,45 @@ impl ModernConnection {
                 "Use movement or sequenced-action methods for this packet",
             )),
         }
+    }
+
+    /// Requests an ordinary fresh item stack. It does not update local inventory:
+    /// the caller applies InventoryContent/InventorySlot only when the server sends them.
+    /// Counts greater than an item's native stack limit may be rejected by the server.
+    pub fn set_creative_hotbar_slot(&self, slot: u8, item_name: &str, count: u8) -> Result<()> {
+        if slot > 8 || count == 0 || count > 64 {
+            return Err(invalid("Invalid creative hotbar request"));
+        }
+        if self.shared.player.lock().unwrap().is_none()
+            || !self
+                .shared
+                .abilities
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map_or(false, |v| v.instant_build)
+        {
+            return Err(invalid("Server has not granted creative inventory control"));
+        }
+        let names = self
+            .shared
+            .item_names
+            .as_ref()
+            .ok_or_else(|| invalid("Creative inventory requires an exact item registry"))?;
+        let item_id = names
+            .iter()
+            .position(|name| name == item_name)
+            .ok_or_else(|| invalid("Item name is absent from the exact registry"))?;
+        if item_name == "minecraft:air" {
+            return Err(invalid("Air is an empty stack, not a selectable item"));
+        }
+        self.shared.write(&play::Serverbound::CreativeSlot {
+            slot: 36 + slot as i16,
+            item: Some(play::PlainItemStack {
+                item_id: item_id as u32,
+                count: count as u32,
+            }),
+        })
     }
 
     fn sequenced(&self, build: impl FnOnce(i32) -> play::Serverbound) -> Result<i32> {
@@ -423,6 +513,28 @@ impl ModernConnection {
             rotation,
         })
     }
+}
+
+fn validate_item_names(names: &[String]) -> Result<()> {
+    if names.is_empty() || names.len() > 65_536 {
+        return Err(invalid("Invalid item registry size"));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        let path = name
+            .strip_prefix("minecraft:")
+            .ok_or_else(|| invalid("Only the exact vanilla item registry is supported"))?;
+        if path.is_empty()
+            || name.len() > 256
+            || !path
+                .bytes()
+                .all(|v| v.is_ascii_lowercase() || v.is_ascii_digit() || b"/_.-".contains(&v))
+            || !seen.insert(name)
+        {
+            return Err(invalid("Invalid or duplicate item registry name"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_transform(current: &Option<LocalTransform>, next: &LocalTransform) -> Result<()> {
@@ -581,7 +693,7 @@ fn read_play(
                     let z = i32::from_be_bytes(payload[4..8].try_into().unwrap());
                     Some(ModernEvent::Chunk(session.chunks[&(x, z)].clone()))
                 }
-                0x05 | 0x09 | 0x21 | 0x2a | 0x38 | 0x49 => {
+                0x05 | 0x09 | 0x13 | 0x15 | 0x21 | 0x2a | 0x38 | 0x49 | 0x53 => {
                     match play::decode_clientbound767(id, &payload, session.context.as_ref())
                         .map_err(protocol)?
                     {
@@ -594,7 +706,26 @@ fn read_play(
                                 updates.len() as u64;
                             Some(ModernEvent::BlockChanges(updates))
                         }
-                        play::Clientbound::Abilities(value) => Some(ModernEvent::Abilities(value)),
+                        play::Clientbound::Abilities(value) => {
+                            *shared.abilities.lock().unwrap() = Some(value.clone());
+                            Some(ModernEvent::Abilities(value))
+                        }
+                        play::Clientbound::InventoryContent(value) => {
+                            for item in value.slots.iter().chain(std::iter::once(&value.carried)) {
+                                validate_inventory_item(shared, item.as_ref())?;
+                            }
+                            Some(ModernEvent::InventoryContent(value))
+                        }
+                        play::Clientbound::InventorySlot(value) => {
+                            validate_inventory_item(shared, value.item.as_ref())?;
+                            Some(ModernEvent::InventorySlot(value))
+                        }
+                        play::Clientbound::SelectedSlot(slot) => {
+                            Some(ModernEvent::SelectedSlot(slot))
+                        }
+                        play::Clientbound::UnsupportedInventory { packet_id, data } => {
+                            Some(ModernEvent::UnsupportedInventory { packet_id, data })
+                        }
                         play::Clientbound::Unload { x, z } => Some(ModernEvent::Unload { x, z }),
                         play::Clientbound::Light { x, z, data } => {
                             Some(ModernEvent::Light { x, z, data })
@@ -636,6 +767,15 @@ fn read_play(
     Ok(())
 }
 
+fn validate_inventory_item(shared: &Shared, item: Option<&play::PlainItemStack>) -> Result<()> {
+    if let (Some(names), Some(item)) = (&shared.item_names, item) {
+        if item.item_id as usize >= names.len() {
+            return Err(invalid("Inventory item ID outside the exact item registry"));
+        }
+    }
+    Ok(())
+}
+
 fn event_bytes(event: &ModernEvent) -> usize {
     match event {
         ModernEvent::Chunk(chunk) => {
@@ -655,6 +795,8 @@ fn event_bytes(event: &ModernEvent) -> usize {
         }
         ModernEvent::Light { data, .. } => data.byte_count() + 4096,
         ModernEvent::BlockChanges(values) => values.len() * 32 + 4096,
+        ModernEvent::InventoryContent(value) => value.slots.len() * 32 + 4096,
+        ModernEvent::UnsupportedInventory { data, .. } => data.len() + 4096,
         _ => 4096,
     }
 }
@@ -967,6 +1109,118 @@ mod tests {
         assert!(actions.next_sequence().is_err());
         actions.next = i32::MAX;
         assert!(actions.next_sequence().is_err());
+    }
+
+    #[test]
+    fn creative_inventory_uses_exact_item_ids_and_server_echoes_only() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let peer = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut connection = wire::Framed::new(stream);
+            peer_login(&mut connection);
+            connection.write_packet(0x2b, &join()).unwrap();
+            connection
+                .write_packet(0x40, &teleport([0.0, 4.0, 0.0], [0.0; 2], 0, 1))
+                .unwrap();
+            assert_eq!(connection.read_packet().unwrap(), (0, vec![1]));
+            assert_eq!(connection.read_packet().unwrap().0, 0x1b);
+            let mut abilities = vec![13];
+            abilities.extend_from_slice(&0.05f32.to_be_bytes());
+            abilities.extend_from_slice(&0.1f32.to_be_bytes());
+            connection.write_packet(0x38, &abilities).unwrap();
+            let mut content = vec![0, 0, 46];
+            content.extend_from_slice(&[0; 47]);
+            connection.write_packet(0x13, &content).unwrap();
+            assert_eq!(connection.read_packet().unwrap(), (0x23, vec![2]));
+            // The only block-state catalog entry is air, but the item ID for stone is 1.
+            assert_eq!(
+                connection.read_packet().unwrap(),
+                (0x32, vec![0, 36, 64, 1, 0, 0])
+            );
+            connection
+                .write_packet(0x15, &[0, 1, 0, 36, 64, 1, 0, 0])
+                .unwrap();
+            assert_eq!(connection.read_packet().unwrap(), (0x2f, vec![0, 0]));
+            connection.write_packet(0x53, &[0]).unwrap();
+            connection
+                .write_packet(0x15, &[0, 2, 0, 36, 1, 1, 1, 0, 42, 99])
+                .unwrap();
+            assert!(connection.read_packet().is_err());
+        });
+        let names = Arc::new(vec!["minecraft:air".into(), "minecraft:stone".into()]);
+        let (runtime, events) = ModernConnection::connect_loopback_with_items(
+            address,
+            "RuntimeTest",
+            catalog(),
+            names.clone(),
+        )
+        .unwrap();
+        assert_eq!(runtime.item_registry_names().unwrap(), names.as_slice());
+        assert_eq!(runtime.biome_registry_entries()[0].id, "minecraft:plains");
+        assert!(runtime.biome_registry_entries()[0].data.is_some());
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ModernEvent::Joined { .. }
+        ));
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ModernEvent::Teleported { .. }
+        ));
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), ModernEvent::Abilities(v) if v.instant_build)
+        );
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), ModernEvent::InventoryContent(v) if v.slots.len() == 46 && v.slots.iter().all(Option::is_none))
+        );
+        assert!(runtime
+            .set_creative_hotbar_slot(0, "minecraft:unknown", 64)
+            .is_err());
+        assert!(runtime
+            .set_creative_hotbar_slot(9, "minecraft:stone", 64)
+            .is_err());
+        assert!(runtime
+            .set_creative_hotbar_slot(0, "minecraft:air", 64)
+            .is_err());
+        runtime.send(play::Serverbound::Flying(true)).unwrap();
+        runtime
+            .set_creative_hotbar_slot(0, "minecraft:stone", 64)
+            .unwrap();
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), ModernEvent::InventorySlot(v) if v.slot == 36 && v.item.as_ref().unwrap().item_id == 1)
+        );
+        runtime.send(play::Serverbound::SelectedSlot(0)).unwrap();
+        assert!(matches!(
+            events.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ModernEvent::SelectedSlot(0)
+        ));
+        assert!(
+            matches!(events.recv_timeout(Duration::from_secs(5)).unwrap(), ModernEvent::UnsupportedInventory { packet_id: 0x15, data } if data == vec![0, 2, 0, 36, 1, 1, 1, 0, 42, 99])
+        );
+        assert!(runtime.is_connected());
+        drop(events);
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn item_catalog_rejects_aliases_duplicates_and_modded_names() {
+        for names in [
+            vec![],
+            vec!["minecraft:stone", "minecraft:stone"],
+            vec!["stone"],
+            vec!["minecraft:"],
+            vec!["create:shaft"],
+            vec!["minecraft:Stone"],
+        ] {
+            assert!(
+                validate_item_names(&names.iter().map(|v| v.to_string()).collect::<Vec<_>>())
+                    .is_err()
+            );
+        }
+        validate_item_names(&["minecraft:air".into(), "minecraft:stone".into()]).unwrap();
     }
 
     #[test]
