@@ -1,35 +1,74 @@
-# <img src="resources/assets/leafish/logo/leafish-logo.svg" width="75" alt="Leafish logo"> Leafish
+# <img src="resources/assets/leafish/logo/leafish-logo.svg" width="75" alt="Leafish logo"> Leafish — Experimental Rust Client for Minecraft Java 1.21.1
+
+[![Download experimental source](https://img.shields.io/badge/Download%20experimental%20source-b45309?style=for-the-badge)](https://github.com/Arthurman70/Leafish/archive/refs/heads/minecraft-1.21.1.zip) [![Read port status](https://img.shields.io/badge/Read%20port%20status-475569?style=for-the-badge)](https://github.com/Arthurman70/Leafish/blob/minecraft-1.21.1/PORTING_1_21_1.md)
+
+[Local Creative test setup](PORTING_1_21_1.md#local-creative-play) · [Fork research](FORK_RESEARCH.md) · [FAQ](#frequently-asked-questions)
+
+**Development source only; no installer release for this port.** The current milestone is a limited local Creative test against a separate vanilla server. Full gameplay, remote authentication and NeoForge/Create compatibility remain unfinished.
+
+**Downloads and setup:** [Download experimental source](https://github.com/Arthurman70/Leafish/archive/refs/heads/minecraft-1.21.1.zip) · [Read port status](https://github.com/Arthurman70/Leafish/blob/minecraft-1.21.1/PORTING_1_21_1.md)
 
 ## This fork: Minecraft 1.21.1 port in progress
 
-This fork continues Leafish as a native Rust client, targeting Minecraft Java
-1.21.1 (protocol 767), with NeoForge 21.1.236 and Create compatibility as later
-integration targets. **It is not yet a playable 1.21.1 client.**
+This fork continues Leafish as a native Rust client targeting Minecraft Java
+1.21.1 (protocol 767). The current milestone is an **experimental local Creative
+test path**, documented in [PORTING_1_21_1.md](PORTING_1_21_1.md). It uses a
+separate official vanilla 1.21.1 server on loopback with a disposable world.
 
-An isolated vanilla 1.21.1 test now completes configuration and a bounded Play
-session without a renderer: 45 chunks, 1,080 sections, 4,423,680 block-state
-values, and two distinct keepalive exchanges. The section decoder also passes
-independent fixtures produced by Minecraft's own encoder. An independent saved-world
-comparison matched all 4,423,680 block-state values and 69,120 biome values from
-those 45 chunks.
+The port notes describe terrain rendering, ordinary dry movement, Creative
+flight, hotbar/block selection and server-confirmed block edits. Independent
+protocol and saved-world checks support those bounded results. They do not
+establish a complete playable replacement, full survival, general multiplayer
+authentication, NeoForge/Create mod compatibility or a performance improvement.
 
-The Windows client builds, and 55 protocol tests pass. The client now has tested
-signed-height storage, an exact runtime state catalog, a bounded native network
-adapter, and read-only local asset mounting. Modern model selection preserves
-namespaces, multipart conditions, parent overrides and direct texture references.
-These components are still being connected to the graphical game. Many Play packets remain
-observed but unimplemented; these results do not establish playable 1.21.1
-support. See the port notes for the separate known legacy test failure.
+See the [port status and build/test instructions](PORTING_1_21_1.md) for the
+current boundaries and [the fork review](FORK_RESEARCH.md) for prior research.
+The legacy compatibility table below describes upstream versions, not modern
+1.21.1 support in this fork.
 
-This work does not currently provide NeoForge/Create mod parity, a Rust server,
-verified 1.21.1 GUI compatibility, or measured performance improvements. Protocol
-767 is not advertised as a supported gameplay version. The legacy version table
-below describes upstream Leafish support.
+## Frequently asked questions
 
-See [port status and portable build/test instructions](PORTING_1_21_1.md) and
-[the existing-fork review](FORK_RESEARCH.md). The review found useful partial
-1.20.4 work, but did not verify an existing 1.21.1 port in the public branches
-checked.
+Answers describe this repository and its documented scope as of **October 23, 2026**.
+
+### Is there a native Rust Minecraft client being developed for Java 1.21.1?
+
+This Leafish fork targets Minecraft Java 1.21.1, protocol 767, using a native Rust client. It remains an experimental port. A limited local Creative test path is documented; it is not a complete replacement for the official client. The [port notes](PORTING_1_21_1.md) are the detailed status reference.
+
+### Can I play ordinary Minecraft 1.21.1 servers with this fork today?
+
+General multiplayer gameplay is not supported by this port. The documented modern test path connects only to a separate loopback vanilla 1.21.1 server and a disposable Creative world. The legacy server browser still excludes protocol 767, and remote authentication remains unfinished.
+
+### What can the experimental local Creative mode actually do?
+
+The port notes document terrain rendering, ordinary dry walking, sprinting, jumping, stepping, Creative flight, a hotbar/block picker, and server-confirmed block breaking and placement. Those bounded checks do not establish survival, complete inventories, entities, swimming, dimension changes or full visual parity. See [Local Creative play](PORTING_1_21_1.md#local-creative-play).
+
+### Does this Leafish fork support NeoForge or Create mods?
+
+NeoForge 21.1.236 and Create 6.0.10 are future integration targets, not currently supported gameplay features. This fork does not claim mod parity. Upstream Leafish’s older Forge compatibility table describes older protocol work and must not be read as proof of modern NeoForge/Create support.
+
+### Where can I download the Minecraft 1.21.1 port?
+
+Use the **Download experimental source** button above for the `minecraft-1.21.1` branch and follow the [build notes](PORTING_1_21_1.md). This fork has no published installer release. The upstream installers preserved later in this README do not contain this port.
+
+### Does the source download include Minecraft assets or a ready-to-play world?
+
+No. The documented local setup requires your own vanilla client assets, exact generated reference reports and a separate server/world. Generated assets and game archives are local inputs rather than bundled downloads. Follow the port’s setup instructions instead of assuming the source ZIP contains a complete game installation.
+
+### Is Leafish also a Minecraft server written in Rust?
+
+No. This repository is a client fork. Its current local Creative test uses a separate official vanilla Java server for authoritative world behavior and saves. A Rust server implementation is outside the current port’s scope.
+
+### Will this Rust port give me higher FPS than the official Minecraft client?
+
+No comparative performance gain has been established for this fork. Being written in Rust does not by itself demonstrate higher FPS or lower memory use. The upstream overview’s general performance discussion is not a benchmark of the 1.21.1 port.
+
+### Can I test the port with an existing world I care about?
+
+Use a separate disposable test world and profile. The documented verification modes deliberately move the player and change blocks, and the feature set is incomplete. The [port notes](PORTING_1_21_1.md) distinguish read-only comparisons from diagnostics that mutate the test world.
+
+### How can I contribute or report a problem with this fork?
+
+Start with [PORTING_1_21_1.md](PORTING_1_21_1.md) and [FORK_RESEARCH.md](FORK_RESEARCH.md), then [open an issue in this repository](https://github.com/Arthurman70/Leafish/issues) with the branch, revision and reproducible test. Keep installed Minecraft artwork, private worlds and credentials out of public reports. Upstream community and attribution links are preserved below.
 
 The upstream README, credits, and links are preserved below. Its installers
 and releases are upstream artifacts; they do not contain this port. Its general
